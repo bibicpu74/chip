@@ -12,10 +12,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
-    defaults:
-      run:
-        working-directory: /home/runner/work/los
-
     env:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
       RBE_SERVICE: grpcs://remote.buildbuddy.io
@@ -61,6 +57,7 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Validate BuildBuddy secret
+        working-directory: /home/runner/work/los
         run: |
           set -e
           if [ -z "${BUILDBUDDY_API_KEY:-}" ]; then
@@ -80,11 +77,14 @@ jobs:
           save-always: true
 
       - name: repo init + local manifest
+        working-directory: /home/runner/work
         run: |
           set -eux
           git config --global user.email "ci@local"
           git config --global user.name "ci"
           git config --global color.ui false
+          mkdir -p /home/runner/work/los
+          cd /home/runner/work/los
           repo init --depth=1 -u https://github.com/LineageOS/android.git -b lineage-22.2
           mkdir -p .repo/local_manifests
           cp "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml" ".repo/local_manifests/star2lte.xml"
@@ -113,6 +113,7 @@ jobs:
           df -h / /home/runner/work/los
 
       - name: Inspect reclient
+        working-directory: /home/runner/work/los
         run: |
           set -eux
           ls -lah prebuilts/remoteexecution-client/live
@@ -124,6 +125,7 @@ jobs:
           prebuilts/remoteexecution-client/live/rewrapper --help 2>&1 | head -160 || true
 
       - name: BuildBuddy connectivity
+        working-directory: /home/runner/work/los
         run: |
           set -eux
           getent hosts remote.buildbuddy.io
@@ -138,6 +140,7 @@ jobs:
           esac
 
       - name: Configure Lineage build environment for RBE
+        working-directory: /home/runner/work/los
         run: |
           set -ex
           mkdir -p /tmp/rbe-test
@@ -209,6 +212,7 @@ jobs:
           find /tmp/rbe-test -maxdepth 2 -type f -printf '%p\n' 2>/dev/null || true
 
       - name: Find a real C++ compile target
+        working-directory: /home/runner/work/los
         run: |
           set -ex
           source build/envsetup.sh
@@ -279,6 +283,7 @@ jobs:
           cat /tmp/rbe-test/cxx-target.txt
 
       - name: Execute one real C++ compile
+        working-directory: /home/runner/work/los
         run: |
           set -ex
           source build/envsetup.sh
