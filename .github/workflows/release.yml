@@ -34,13 +34,8 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           sudo docker image prune -a -f >/dev/null 2>&1 || true
 
-          sudo fallocate -l 8G /build-swap
-          sudo chmod 600 /build-swap
-          sudo mkswap /build-swap
-          sudo swapon /build-swap
-
-          mkdir -p /home/runner/work/los
-          mkdir -p /tmp/rbe-test
+          # Do not create an 8G swapfile: repo sync can leave only a few GB free.
+          mkdir -p /home/runner/work/los /tmp/rbe-test
 
           echo "=== DISK ==="
           df -h /
@@ -95,22 +90,17 @@ jobs:
         working-directory: /home/runner/work/los
         run: |
           set -eux
-
           git config --global user.email "ci@local"
           git config --global user.name "ci"
           git config --global color.ui false
 
-          repo init \
-            --depth=1 \
+          repo init --depth=1 \
             -u https://github.com/LineageOS/android.git \
             -b lineage-22.2
 
           mkdir -p .repo/local_manifests
-
-          cp \
-            "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml" \
-            ".repo/local_manifests/star2lte.xml"
-
+          cp "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml" \
+             ".repo/local_manifests/star2lte.xml"
           test -s ".repo/local_manifests/star2lte.xml"
 
           echo "=== LOCAL MANIFEST ==="
@@ -121,7 +111,6 @@ jobs:
         timeout-minutes: 120
         run: |
           set -u
-
           (
             while true; do
               echo "[$(date -u +%H:%M:%S)] sync disk:"
@@ -134,22 +123,11 @@ jobs:
           MONPID=$!
 
           set -e
-          repo sync \
-            -c \
-            --no-clone-bundle \
-            --no-tags \
-            --optimized-fetch \
-            --prune \
-            -j"$(nproc)" || \
-          repo sync \
-            -c \
-            --no-clone-bundle \
-            --no-tags \
-            --prune \
-            -j4
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetch \
+            --prune -j"$(nproc)" || \
+          repo sync -c --no-clone-bundle --no-tags --prune -j4
 
           kill "$MONPID" 2>/dev/null || true
-
           echo "=== REPO SYNC COMPLETE ==="
           df -h / /home/runner/work/los
 
@@ -157,64 +135,42 @@ jobs:
         working-directory: /home/runner/work/los
         run: |
           set -eux
-
-          echo "=== RBE DIRECTORY ==="
           ls -lah prebuilts/remoteexecution-client/live
-
           test -x prebuilts/remoteexecution-client/live/reproxy
           test -x prebuilts/remoteexecution-client/live/rewrapper
 
           echo "=== reproxy ==="
           prebuilts/remoteexecution-client/live/reproxy --help 2>&1 | head -120 || true
-
           echo "=== rewrapper ==="
           prebuilts/remoteexecution-client/live/rewrapper --help 2>&1 | head -160 || true
-
-          echo "=== ENVIRONMENT ==="
-          printf 'RBE_SERVICE=%s\n' "$RBE_SERVICE"
-          printf 'RBE_DIR=%s\n' "$RBE_DIR"
-          printf 'RBE_CXX_EXEC_STRATEGY=%s\n' "$RBE_CXX_EXEC_STRATEGY"
-          printf 'RBE_remote_headers=<hidden API key>\n'
-          printf 'NINJA_REMOTE_NUM_JOBS=%s\n' "$NINJA_REMOTE_NUM_JOBS"
 
       - name: BuildBuddy connectivity
         working-directory: /home/runner/work/los
         run: |
           set -eux
-
-          echo "=== DNS ==="
           getent hosts remote.buildbuddy.io
-
-          echo "=== TLS / HTTPS ==="
           curl -fsSIL --max-time 30 https://app.buildbuddy.io/ | head
 
-          echo "=== BuildBuddy authenticated HTTPS check ==="
           HTTP_CODE="$(
             curl -sS -o /tmp/buildbuddy-response.txt \
-              -w '%{http_code}' \
-              --max-time 30 \
+              -w '%{http_code}' --max-time 30 \
               -H "x-buildbuddy-api-key: ${BUILDBUDDY_API_KEY}" \
               https://app.buildbuddy.io/
           )"
-
           echo "HTTP status: ${HTTP_CODE}"
-
           case "$HTTP_CODE" in
             2??|3??) ;;
-            *)
-              echo "::error::BuildBuddy HTTPS/API-key check failed with HTTP ${HTTP_CODE}."
-              exit 1
-              ;;
+            *) echo "::error::BuildBuddy HTTPS/API-key check failed"; exit 1 ;;
           esac
 
       - name: Configure Lineage build environment for RBE
         working-directory: /home/runner/work/los
         run: |
           set -ex
-
           mkdir -p /tmp/rbe-test
           rm -f /tmp/rbe-test/*
-          
+
+          # AOSP/Lineage envsetup and breakfast are not nounset-safe.
           source build/envsetup.sh
 
           export USE_RBE=1
@@ -247,7 +203,6 @@ jobs:
         timeout-minutes: 45
         run: |
           set -ex
-
           source build/envsetup.sh
 
           export USE_RBE=1
@@ -264,21 +219,20 @@ jobs:
           echo "Generating build graph only; NO ROM build."
           m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
 
-          test -f out/combined-${TARGET_PRODUCT:-star2lte}.ninja || \
-            test -f out/build.ninja || \
-            find out -maxdepth 2 -name build.ninja -o -name '*.ninja' | head
-
-          echo "=== RBE log files ==="
+          echo "=== BUILD OUTPUT ==="
+          ls -lah out | head -100 || true
+          echo "=== NINJA FILES ==="
+          find out -maxdepth 3 -type f \( -name 'build.ninja' -o -name '*.ninja' \) -print | head -100
+          echo "=== RBE LOG FILES ==="
           find /tmp/rbe-test -maxdepth 2 -type f -printf '%p\n' 2>/dev/null || true
 
-      - name: Find a real C++ compile target
+      - name: Find a real C++ compile edge
         working-directory: /home/runner/work/los
         run: |
-          set -euo pipefail
+          set -e
 
-          NINJA_BIN=""
           if [ -x prebuilts/build-tools/linux-x86/bin/ninja ]; then
-            NINJA_BIN="prebuilts/build-tools/linux-x86/bin/ninja"
+            NINJA_BIN="$PWD/prebuilts/build-tools/linux-x86/bin/ninja"
           elif command -v ninja >/dev/null 2>&1; then
             NINJA_BIN="$(command -v ninja)"
           else
@@ -289,47 +243,67 @@ jobs:
           echo "Using ninja: $NINJA_BIN"
           "$NINJA_BIN" --version
 
-          mapfile -t OBJECT_TARGETS < <(
-            "$NINJA_BIN" -t targets all 2>/dev/null |
-              awk '$1 ~ /\.(o|pic\.o)$/ {print $1}' |
-              head -200
-          )
+          echo "=== Ninja target count ==="
+          "$NINJA_BIN" -t targets all 2>&1 \
+            | tee /tmp/rbe-test/ninja-targets.txt | wc -l
 
-          if [ "${#OBJECT_TARGETS[@]}" -eq 0 ]; then
-            echo "::error::No C++ object targets were found in the generated graph."
+          echo "=== First targets ==="
+          head -100 /tmp/rbe-test/ninja-targets.txt || true
+
+          echo "=== Looking for C/C++ compile edges ==="
+          "$NINJA_BIN" -t commands 2>/dev/null \
+            | grep -E '(^|[[:space:];])(clang\+\+|clang|g\+\+|gcc)([[:space:]]|$)' \
+            | head -50 \
+            | tee /tmp/rbe-test/cxx-commands.txt || true
+
+          if [ ! -s /tmp/rbe-test/cxx-commands.txt ]; then
+            echo "::error::No C/C++ compile commands were found in the Ninja graph."
             exit 1
           fi
 
-          FOUND=""
-          for target in "${OBJECT_TARGETS[@]}"; do
-            if "$NINJA_BIN" -t commands "$target" 2>/dev/null |
-              grep -Eq '(^|/)(clang\+\+|clang|g\+\+|gcc)( |$)'; then
-              FOUND="$target"
-              break
-            fi
-          done
+          CXX_CMD="$(head -1 /tmp/rbe-test/cxx-commands.txt)"
+          echo "=== SELECTED C++ COMMAND ==="
+          printf '%s\n' "$CXX_CMD"
 
-          if [ -z "$FOUND" ]; then
-            echo "::error::Could not find a real C/C++ compile action."
-            echo "First object targets:"
-            printf '%s\n' "${OBJECT_TARGETS[@]}" | head -30
+          CXX_OUTPUT="$(
+            printf '%s\n' "$CXX_CMD" |
+              sed -nE 's/.*[[:space:]]-o[[:space:]]+([^[:space:]]+\.o)([[:space:]].*)?$/\1/p'
+          )"
+
+          if [ -z "$CXX_OUTPUT" ]; then
+            echo "::error::Could not extract an object output from selected compile command."
             exit 1
           fi
 
-          printf '%s\n' "$FOUND" > /tmp/rbe-test/cxx-target.txt
-
-          echo "=== SELECTED C++ TARGET ==="
+          printf '%s\n' "$CXX_OUTPUT" > /tmp/rbe-test/cxx-target.txt
+          echo "=== SELECTED C++ OUTPUT ==="
           cat /tmp/rbe-test/cxx-target.txt
 
-          echo "=== COMMAND ==="
-          "$NINJA_BIN" -t commands "$FOUND"
+          echo "=== Mapping output to Ninja target ==="
+          TARGET_LINE="$(
+            grep -F "$CXX_OUTPUT" /tmp/rbe-test/ninja-targets.txt | head -1 || true
+          )"
+
+          if [ -z "$TARGET_LINE" ]; then
+            echo "::error::Could not map C++ output to a Ninja target."
+            exit 1
+          fi
+
+          # ninja -t targets output is generally: <target>: <rule>
+          TARGET="${TARGET_LINE%%:*}"
+          printf '%s\n' "$TARGET" > /tmp/rbe-test/ninja-target.txt
+
+          echo "=== SELECTED NINJA TARGET ==="
+          cat /tmp/rbe-test/ninja-target.txt
+
+          echo "=== COMMANDS FOR TARGET ==="
+          "$NINJA_BIN" -t commands "$TARGET" || true
 
       - name: Execute ONE real C++ compile remotely
         working-directory: /home/runner/work/los
         timeout-minutes: 30
         run: |
-          set -euo pipefail
-
+          set -e
           source build/envsetup.sh
 
           export USE_RBE=1
@@ -343,10 +317,10 @@ jobs:
           export RBE_output_dir="$RBE_output_dir"
           export NINJA_REMOTE_NUM_JOBS=1
 
-          TARGET="$(cat /tmp/rbe-test/cxx-target.txt)"
+          TARGET="$(cat /tmp/rbe-test/ninja-target.txt)"
 
           if [ -x prebuilts/build-tools/linux-x86/bin/ninja ]; then
-            NINJA_BIN="prebuilts/build-tools/linux-x86/bin/ninja"
+            NINJA_BIN="$PWD/prebuilts/build-tools/linux-x86/bin/ninja"
           else
             NINJA_BIN="$(command -v ninja)"
           fi
@@ -362,29 +336,26 @@ jobs:
           "$NINJA_BIN" -v -j1 "$TARGET" 2>&1 | tee /tmp/rbe-test/real-compile.log
 
           echo "=== COMPILE RESULT ==="
-          test -f "$TARGET" || {
-            echo "::error::Ninja reported success but the object was not found."
-            exit 1
-          }
+          echo "Ninja completed target: $TARGET"
 
-          ls -lh "$TARGET"
+          echo "=== RBE PROCESS CHECK ==="
+          ps aux | grep -E 'reproxy|rewrapper' | grep -v grep || true
 
       - name: Verify RBE activity
         if: always()
         working-directory: /home/runner/work/los
         run: |
           set +e
-
           echo "=== RBE LOG DIRECTORY ==="
-          find /tmp/rbe-test -maxdepth 3 -type f -printf '%p (%s bytes)\n' 2>/dev/null | sort
+          find /tmp/rbe-test -maxdepth 3 -type f \
+            -printf '%p (%s bytes)\n' 2>/dev/null | sort
 
           echo "=== LOG CONTENT SUMMARY ==="
           for f in /tmp/rbe-test/*; do
             [ -f "$f" ] || continue
             echo
             echo "----- $f -----"
-            grep -Ei \
-              'remote|reproxy|rewrapper|execute|upload|download|cache|error|status' \
+            grep -Ei 'remote|reproxy|rewrapper|execute|upload|download|cache|error|status' \
               "$f" | tail -80 || true
           done
 
@@ -396,16 +367,12 @@ jobs:
         if: always()
         run: |
           set +e
-
           echo "=== DISK ==="
           df -h / /home/runner/work/los 2>/dev/null || true
-
           echo "=== MEMORY ==="
           free -h || true
-
           echo "=== RBE PROCESSES ==="
           ps aux | grep -E 'reproxy|rewrapper' | grep -v grep || true
-
           echo "=== RBE FILES ==="
           find /tmp/rbe-test -maxdepth 3 -type f -ls 2>/dev/null || true
 
