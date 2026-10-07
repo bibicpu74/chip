@@ -214,10 +214,9 @@ jobs:
 
           mkdir -p /tmp/rbe-test
           rm -f /tmp/rbe-test/*
-
-          set -u
-
+          
           source build/envsetup.sh
+          set -u
 
           export USE_RBE=1
           export RBE_service="$RBE_SERVICE"
