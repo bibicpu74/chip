@@ -240,4 +240,21 @@
   <remove-project name="trusty/lib" />
   <remove-project name="trusty/vendor/google/aosp" />
 
+  <!-- ===== tier 5: remove dangling test/tool consumers =====
+     Their providers (Car / Cuttlefish / Virtualization) are intentionally
+     absent from this star2lte CI tree. Keeping these projects makes Soong
+     parse Android.bp modules whose defaults no longer exist. -->
+
+<!-- CTS contains Car tests requiring packages/services/Car -->
+<remove-project name="platform/cts" />
+
+<!-- platform_testing automotive tools require device/google/cuttlefish -->
+<remove-project name="platform/platform_testing" />
+
+<!-- secretkeeper requires AVF defaults from packages/modules/Virtualization -->
+<remove-project name="platform/system/secretkeeper" />
+
+<!-- security fuzzers require packages/services/Car watchdog defaults -->
+<remove-project name="platform/tools/security" />
+
 </manifest>
