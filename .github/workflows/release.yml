@@ -1,0 +1,110 @@
+name: Test BuildBuddy RBE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rbe-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      RBE_SERVICE: grpcs://remote.buildbuddy.io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check BuildBuddy configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== BuildBuddy configuration ==="
+          echo "RBE service: ${RBE_SERVICE}"
+          echo "API key configured: $([ -n "${BUILDBUDDY_API_KEY:-}" ] && echo yes || echo NO)"
+
+          if [ -z "${BUILDBUDDY_API_KEY:-}" ]; then
+            echo "::error::BUILDBUDDY_API_KEY GitHub Secret is missing"
+            exit 1
+          fi
+
+      - name: Install basic tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            git \
+            jq \
+            ca-certificates
+
+      - name: Test BuildBuddy TLS endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== DNS ==="
+          getent hosts remote.buildbuddy.io
+
+          echo
+          echo "=== HTTPS BuildBuddy API ==="
+
+          HTTP_CODE="$(
+            curl \
+              --silent \
+              --show-error \
+              --output /tmp/buildbuddy-response \
+              --write-out '%{http_code}' \
+              --max-time 20 \
+              -H "x-buildbuddy-api-key: ${BUILDBUDDY_API_KEY}" \
+              https://app.buildbuddy.io/
+          )"
+
+          echo "HTTP status: ${HTTP_CODE}"
+
+          if [ "$HTTP_CODE" -ge 500 ]; then
+            echo "::error::BuildBuddy server returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+          echo "BuildBuddy HTTPS endpoint reachable."
+
+      - name: Download AOSP reclient
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d prebuilts/remoteexecution-client/live ]; then
+            echo "AOSP reclient already exists."
+            exit 0
+          fi
+
+          echo "::error::prebuilts/remoteexecution-client/live does not exist."
+          echo "This test repository does not contain the AOSP reclient."
+          exit 1
+
+      - name: Inspect reclient
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RBE_DIR="$GITHUB_WORKSPACE/prebuilts/remoteexecution-client/live"
+
+          echo "=== RBE directory ==="
+          ls -lah "$RBE_DIR"
+
+          echo
+          echo "=== reproxy ==="
+          test -x "$RBE_DIR/reproxy"
+          "$RBE_DIR/reproxy" --help | head -80 || true
+
+          echo
+          echo "=== rewrapper ==="
+          test -x "$RBE_DIR/rewrapper"
+          "$RBE_DIR/rewrapper" --help | head -80 || true
+
+      - name: Finish
+        run: |
+          echo "BuildBuddy basic connectivity test completed."
+          echo "No AOSP compilation was started."
