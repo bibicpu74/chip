@@ -264,7 +264,9 @@
        dependencies during Soong graph generation. -->
 
   <!-- Android test suites -->
-  <remove-project name="platform/test/app_compat/csuite" />
+  <!-- KEEP platform/test/app_compat/csuite:
+       it provides the Soong "csuite_test" module type used by frameworks/base
+       and art/test, so removing it makes Soong fail while parsing Android.bp. -->
   <remove-project name="platform/test/catbox" />
   <remove-project name="platform/test/cts-root" />
   <remove-project name="platform/test/dittosuite" />
