@@ -1,54 +1,70 @@
-name: Test BuildBuddy RBE
-
-on:
-  workflow_dispatch:
-
-jobs:
-  rbe-test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
-    env:
-      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-      RBE_SERVICE: grpcs://remote.buildbuddy.io
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Check BuildBuddy configuration
-        shell: bash
+- name: Test BuildBuddy RBE
+        working-directory: /home/runner/work/los
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+          RBE_SERVICE: grpcs://remote.buildbuddy.io
         run: |
           set -euo pipefail
 
-          echo "=== BuildBuddy configuration ==="
-          echo "RBE service: ${RBE_SERVICE}"
-          echo "API key configured: $([ -n "${BUILDBUDDY_API_KEY:-}" ] && echo yes || echo NO)"
+          echo "========================================"
+          echo " BuildBuddy RBE REAL TEST"
+          echo "========================================"
+
+          # --------------------------------------------------
+          # 1. Check credentials
+          # --------------------------------------------------
 
           if [ -z "${BUILDBUDDY_API_KEY:-}" ]; then
-            echo "::error::BUILDBUDDY_API_KEY GitHub Secret is missing"
+            echo "::error::BUILDBUDDY_API_KEY is missing"
             exit 1
           fi
 
-      - name: Install basic tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            curl \
-            git \
-            jq \
-            ca-certificates
+          echo "[OK] BuildBuddy API key is configured"
 
-      - name: Test BuildBuddy TLS endpoint
-        shell: bash
-        run: |
-          set -euo pipefail
+          # --------------------------------------------------
+          # 2. Check AOSP reclient
+          # --------------------------------------------------
 
-          echo "=== DNS ==="
-          getent hosts remote.buildbuddy.io
+          RBE_DIR="$PWD/prebuilts/remoteexecution-client/live"
 
           echo
-          echo "=== HTTPS BuildBuddy API ==="
+          echo "RBE_DIR=$RBE_DIR"
+
+          if [ ! -d "$RBE_DIR" ]; then
+            echo "::error::AOSP reclient directory does not exist"
+            echo "Expected:"
+            echo "$RBE_DIR"
+            exit 1
+          fi
+
+          if [ ! -x "$RBE_DIR/reproxy" ]; then
+            echo "::error::reproxy missing or not executable"
+            ls -lah "$RBE_DIR"
+            exit 1
+          fi
+
+          if [ ! -x "$RBE_DIR/rewrapper" ]; then
+            echo "::error::rewrapper missing or not executable"
+            ls -lah "$RBE_DIR"
+            exit 1
+          fi
+
+          echo "[OK] reproxy exists"
+          echo "[OK] rewrapper exists"
+
+          # --------------------------------------------------
+          # 3. Network
+          # --------------------------------------------------
+
+          echo
+          echo "=== DNS ==="
+
+          getent hosts remote.buildbuddy.io
+
+          echo "[OK] DNS resolution"
+
+          echo
+          echo "=== HTTPS ==="
 
           HTTP_CODE="$(
             curl \
@@ -64,47 +80,130 @@ jobs:
           echo "HTTP status: ${HTTP_CODE}"
 
           if [ "$HTTP_CODE" -ge 500 ]; then
-            echo "::error::BuildBuddy server returned HTTP ${HTTP_CODE}"
+            echo "::error::BuildBuddy HTTPS returned ${HTTP_CODE}"
+            cat /tmp/buildbuddy-response || true
             exit 1
           fi
 
-          echo "BuildBuddy HTTPS endpoint reachable."
+          echo "[OK] BuildBuddy HTTPS reachable"
 
-      - name: Download AOSP reclient
-        shell: bash
-        run: |
-          set -euo pipefail
+          # --------------------------------------------------
+          # 4. Create reclient config
+          # --------------------------------------------------
 
-          if [ -d prebuilts/remoteexecution-client/live ]; then
-            echo "AOSP reclient already exists."
-            exit 0
+          mkdir -p /tmp/rbe-test
+
+          cat > /tmp/rbe-test/reproxy.cfg <<EOF
+service=${RBE_SERVICE}
+EOF
+
+          echo
+          echo "=== reproxy version/help ==="
+
+          "$RBE_DIR/reproxy" --help | head -60 || true
+
+          echo
+          echo "=== rewrapper version/help ==="
+
+          "$RBE_DIR/rewrapper" --help | head -60 || true
+
+          # --------------------------------------------------
+          # 5. Start reproxy
+          # --------------------------------------------------
+
+          echo
+          echo "========================================"
+          echo " Starting reproxy"
+          echo "========================================"
+
+          "$RBE_DIR/reproxy" \
+            --cfg="$RBE_DIR/reproxy.cfg" \
+            > /tmp/rbe-test/reproxy.log 2>&1 &
+
+          REPROXY_PID=$!
+
+          cleanup() {
+            echo
+            echo "=== reproxy log ==="
+            cat /tmp/rbe-test/reproxy.log || true
+
+            kill "$REPROXY_PID" 2>/dev/null || true
+            wait "$REPROXY_PID" 2>/dev/null || true
+          }
+
+          trap cleanup EXIT
+
+          sleep 5
+
+          if ! kill -0 "$REPROXY_PID" 2>/dev/null; then
+            echo "::error::reproxy exited during startup"
+            cat /tmp/rbe-test/reproxy.log || true
+            exit 1
           fi
 
-          echo "::error::prebuilts/remoteexecution-client/live does not exist."
-          echo "This test repository does not contain the AOSP reclient."
-          exit 1
+          echo "[OK] reproxy is running"
 
-      - name: Inspect reclient
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          RBE_DIR="$GITHUB_WORKSPACE/prebuilts/remoteexecution-client/live"
-
-          echo "=== RBE directory ==="
-          ls -lah "$RBE_DIR"
+          # --------------------------------------------------
+          # 6. Locate compiler
+          # --------------------------------------------------
 
           echo
-          echo "=== reproxy ==="
-          test -x "$RBE_DIR/reproxy"
-          "$RBE_DIR/reproxy" --help | head -80 || true
+          echo "========================================"
+          echo " Finding compiler"
+          echo "========================================"
+
+          CLANG="$(find prebuilts/clang -type f -name clang -perm -111 2>/dev/null | head -1 || true)"
+
+          if [ -z "$CLANG" ]; then
+            echo "::error::Could not find AOSP clang"
+            exit 1
+          fi
+
+          echo "Compiler:"
+          echo "$CLANG"
+
+          # --------------------------------------------------
+          # 7. Prepare tiny source
+          # --------------------------------------------------
+
+          mkdir -p /tmp/rbe-test/src
+          mkdir -p /tmp/rbe-test/out
+
+          cat > /tmp/rbe-test/src/test.cc <<'EOF'
+          int main() {
+            return 0;
+          }
+          EOF
+
+          # --------------------------------------------------
+          # 8. REAL REMOTE EXECUTION
+          # --------------------------------------------------
 
           echo
-          echo "=== rewrapper ==="
-          test -x "$RBE_DIR/rewrapper"
-          "$RBE_DIR/rewrapper" --help | head -80 || true
+          echo "========================================"
+          echo " Running REAL REMOTE COMPILER ACTION"
+          echo "========================================"
 
-      - name: Finish
-        run: |
-          echo "BuildBuddy basic connectivity test completed."
-          echo "No AOSP compilation was started."
+          "$RBE_DIR/rewrapper" \
+            --cfg="$RBE_DIR/rewrapper.cfg" \
+            "$CLANG" \
+            -c /tmp/rbe-test/src/test.cc \
+            -o /tmp/rbe-test/out/test.o
+
+          # --------------------------------------------------
+          # 9. Verify output
+          # --------------------------------------------------
+
+          if [ ! -f /tmp/rbe-test/out/test.o ]; then
+            echo "::error::Compiler action did not produce output"
+            exit 1
+          fi
+
+          echo
+          echo "========================================"
+          echo " RBE TEST PASSED"
+          echo "========================================"
+          echo
+          echo "Remote compiler action completed."
+          echo "Output:"
+          ls -lh /tmp/rbe-test/out/test.o
