@@ -51,6 +51,8 @@ jobs:
 
       - name: Checkout local manifest
         uses: actions/checkout@v4
+        with:
+          path: repo-config
 
       - name: Install build dependencies
         run: |
@@ -106,7 +108,7 @@ jobs:
           mkdir -p .repo/local_manifests
 
           cp \
-            "$GITHUB_WORKSPACE/.repo-local-manifests/star2lte.xml" \
+            "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml" \
             ".repo/local_manifests/star2lte.xml"
 
           test -s ".repo/local_manifests/star2lte.xml"
@@ -208,10 +210,12 @@ jobs:
       - name: Configure Lineage build environment for RBE
         working-directory: /home/runner/work/los
         run: |
-          set -eux
+          set -ex
 
           mkdir -p /tmp/rbe-test
           rm -f /tmp/rbe-test/*
+
+          set -u
 
           source build/envsetup.sh
 
