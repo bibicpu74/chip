@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LineageOS 22.2 (Android 15) local manifest for star2lte (Galaxy S9+ Exynos 9810).
+
+  Mirrors ExyHyperBrick's OWN lineage-22.2-wip roomservice.xml (the maintainer
+  behind the XDA LOS builds) — trimmed to what star2lte actually needs.
+
+  Changes vs the first (Skyshadow2022) cut, each backed by evidence:
+  - DROPPED  LineageOS/android_hardware_samsung_slsi_nfc: the repo has NO
+    lineage-22.2 branch (only 23.0+) and nothing in the 22.2 device trees
+    references hardware/samsung_slsi/nfc. Pinned as-is it broke repo sync.
+  - DROPPED  ExyHyperBrick/android_hardware_samsung_slsi_exynos_dtbh: not
+    needed at 22.2 — the dtbhtoolExynos host tool the device tree sets via
+    TARGET_CUSTOM_DTBTOOL (BoardConfigCommon.mk:81) is built from
+    LineageOS/android_hardware_samsung @ lineage-22.2
+    (dtbhtool/Android.bp, name: "dtbhtoolExynos").
+  - config + graphics now come from ExyHyperBrick's forks, exactly as in his
+    lineage-22.2-wip manifest (he carries 22.2-era fixes there).
+  - starlte/crownlte trees NOT added: only mentioned in comments inside
+    proprietary-files.txt, never referenced by path.
+
+  IMS/VoLTE (krazey ImsStack/ImsMedia) is intentionally left out of this
+  first build — add it back once a plain build boots.
+
+  Used on top of:  repo init -u https://github.com/LineageOS/android.git -b lineage-22.2
+  Place at:        .repo/local_manifests/star2lte.xml
+-->
+<manifest>
+
+  <!-- ===== device / kernel / vendor (ExyHyperBrick @ lineage-22.2) ===== -->
+  <!-- kernel: OUR fork (Skyshadow2020) = his lineage-22.2 tree + SUSFS v2.2.0
+       + KernelSU-Next (KSU_VERSION 33250 pin, manual hooks) + the madera
+       audio boot-race fix. Same base, same layout, same defconfig name —
+       only the repo differs. Flip back to ExyHyperBrick for a vanilla build. -->
+  <project name="Skyshadow2020/android_kernel_samsung_exynos9810"
+           path="kernel/samsung/exynos9810" remote="github" revision="lineage-22.2" />
+  <project name="ExyHyperBrick/android_device_samsung_exynos9810-common"
+           path="device/samsung/exynos9810-common" remote="github" revision="lineage-22.2" />
+  <project name="ExyHyperBrick/android_device_samsung_star2lte"
+           path="device/samsung/star2lte" remote="github" revision="lineage-22.2" />
+  <project name="ExyHyperBrick/proprietary_vendor_samsung_exynos9810-common"
+           path="vendor/samsung/exynos9810-common" remote="github" revision="lineage-22.2" />
+  <project name="ExyHyperBrick/proprietary_vendor_samsung_star2lte"
+           path="vendor/samsung/star2lte" remote="github" revision="lineage-22.2" />
+
+  <!-- ===== Samsung/Exynos HALs & sepolicy (pinned to ExyHyperBrick's
+       lineage-22.2-wip choices) ===== -->
+  <project name="LineageOS/android_device_samsung_slsi_sepolicy"
+           path="device/samsung_slsi/sepolicy" remote="github" revision="lineage-22.2" />
+  <!-- run #10 lesson: hardware/samsung's Android.bp imports the namespace
+       hardware/google/pixel, and hardware/qcom/sm8150/display imports
+       hardware/google/interfaces — these two CANNOT be dieted (their
+       remove-project lines were dropped; the default.xml projects stay). -->
+  <project name="LineageOS/android_hardware_samsung"
+           path="hardware/samsung" remote="github" revision="lineage-22.2" />
+  <project name="ExyHyperBrick/android_hardware_samsung_slsi-linaro_config"
+           path="hardware/samsung_slsi-linaro/config" remote="github" revision="lineage-22.2" />
+  <project name="LineageOS/android_hardware_samsung_slsi-linaro_exynos"
+           path="hardware/samsung_slsi-linaro/exynos" remote="github" revision="lineage-22.2" />
+  <project name="LineageOS/android_hardware_samsung_slsi-linaro_exynos5"
+           path="hardware/samsung_slsi-linaro/exynos5" remote="github" revision="lineage-22.2" />
+  <project name="ExyHyperBrick/android_hardware_samsung_slsi-linaro_graphics"
+           path="hardware/samsung_slsi-linaro/graphics" remote="github" revision="lineage-22.2" />
+  <project name="LineageOS/android_hardware_samsung_slsi-linaro_interfaces"
+           path="hardware/samsung_slsi-linaro/interfaces" remote="github" revision="lineage-22.2" />
+  <project name="LineageOS/android_hardware_samsung_slsi-linaro_openmax"
+           path="hardware/samsung_slsi-linaro/openmax" remote="github" revision="lineage-22.2" />
+
+  <!-- Disk diet for the single-disk GitHub free runner (145G total, no
+       separate /mnt). Runs #1/#3 died with ENOSPC mid-sync. Strategy:
+       1) partial clone (in build.yml), 2) drop EVERYTHING a star2lte device
+       build never references: emulator/virtual stacks (goldfish/cuttlefish/
+       emulator/qemu + GKI kernel prebuilts + cuttlefish vmm), Google/Pixel
+       device + graphics trees, the whole Car (automotive) stack, TV apps,
+       macOS/Windows toolchains, bazel rule repos, ABI dumps, Virtualization
+       (3.5G), heavy test/fuzz tooling. Names verified 1:1 against the real
+       LOS 22.2 default.xml (98 entries). If a build error ever names a
+       missing project, move that one line back into a <project>. -->
+  <!-- tier 1: emulator-only (runs #1/#3 diet) -->
+  <remove-project name="LineageOS/android_device_generic_goldfish" />
+  <remove-project name="device/generic/goldfish-opengl" />
+  <remove-project name="device/google/cuttlefish" />
+  <remove-project name="device/google/cuttlefish_prebuilts" />
+  <remove-project name="device/google/cuttlefish_vmm" />
+  <remove-project name="platform/prebuilts/android-emulator" />
+  <remove-project name="platform/prebuilts/qemu-kernel" />
+  <!-- tier 2: 98 more verified-unused repos -->
+<remove-project name="device/google/trout" />
+  <remove-project name="device/generic/arm64" />
+  <remove-project name="device/generic/armv7-a-neon" />
+  <remove-project name="device/generic/art" />
+  <remove-project name="device/generic/car" />
+  <remove-project name="LineageOS/android_device_generic_common" />
+  <remove-project name="device/generic/trusty" />
+  <remove-project name="device/generic/x86" />
+  <remove-project name="device/generic/x86_64" />
+  <remove-project name="kernel/prebuilts/6.1/arm64" />
+  <remove-project name="kernel/prebuilts/6.1/x86-64" />
+  <remove-project name="kernel/prebuilts/6.6/arm64" />
+  <remove-project name="kernel/prebuilts/6.6/x86-64" />
+  <remove-project name="kernel/prebuilts/mainline/arm64" />
+  <remove-project name="kernel/prebuilts/mainline/x86-64" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.1/arm64" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.1/x86-64" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.6/arm64" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.6/x86-64" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/mainline/arm64" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/mainline/x86-64" />
+  <remove-project name="kernel/tests" />
+  <remove-project name="platform/hardware/google/aemu" />
+  <remove-project name="platform/hardware/google/apf" />
+  <remove-project name="platform/hardware/google/av" />
+  <remove-project name="LineageOS/android_hardware_google_camera" />
+  <remove-project name="LineageOS/android_hardware_google_gchips" />
+  <remove-project name="platform/hardware/google/gfxstream" />
+  <remove-project name="LineageOS/android_hardware_google_graphics_common" />
+  <remove-project name="platform/hardware/google/graphics/gs101" />
+  <remove-project name="platform/hardware/google/graphics/gs201" />
+  <remove-project name="platform/hardware/google/graphics/zuma" />
+  <remove-project name="platform/hardware/google/graphics/zumapro" />
+  <remove-project name="LineageOS/android_hardware_google_pixel-sepolicy" />
+  <remove-project name="LineageOS/android_hardware_qcom_wlan" />
+  <remove-project name="platform/prebuilts/bazel/common" />
+  <remove-project name="platform/prebuilts/bazel/darwin-x86_64" />
+  <remove-project name="platform/prebuilts/bazel/linux-x86_64" />
+  <remove-project name="platform/prebuilts/clang/host/darwin-x86" />
+  <remove-project name="platform/prebuilts/go/darwin-x86" />
+  <remove-project name="platform/prebuilts/jdk/jdk8" />
+  <remove-project name="platform/prebuilts/asuite" />
+  <remove-project name="platform/prebuilts/abi-dumps/ndk" />
+  <remove-project name="platform/prebuilts/abi-dumps/platform" />
+  <remove-project name="platform/prebuilts/abi-dumps/vndk" />
+  <remove-project name="LineageOS/android_packages_modules_Virtualization" />
+  <remove-project name="LineageOS/android_packages_apps_TvSettings" />
+  <remove-project name="platform/external/autotest" />
+  <remove-project name="platform/external/AFLplusplus" />
+  <remove-project name="platform/external/arm-neon-tests" />
+  <remove-project name="platform/external/bcc" />
+  <remove-project name="platform/external/bazel-skylib" />
+  <remove-project name="platform/external/bazelbuild-kotlin-rules" />
+  <remove-project name="platform/external/bazelbuild-platforms" />
+  <remove-project name="platform/external/bazelbuild-remote-apis" />
+  <remove-project name="platform/external/bazelbuild-rules_android" />
+  <remove-project name="platform/external/bazelbuild-rules_cc" />
+  <remove-project name="platform/external/bazelbuild-rules_go" />
+  <remove-project name="platform/external/bazelbuild-rules_java" />
+  <remove-project name="platform/external/bazelbuild-rules_license" />
+  <remove-project name="platform/external/bazelbuild-rules_python" />
+  <remove-project name="platform/external/bazelbuild-rules_rust" />
+  <remove-project name="platform/external/bazelbuild-rules_testing" />
+  <remove-project name="platform/external/aws-crt-java" />
+  <remove-project name="platform/external/aws-eventstream-java" />
+  <remove-project name="platform/external/aws-sdk-java-v2" />
+  <remove-project name="LineageOS/android_packages_apps_Car_Settings" />
+  <remove-project name="LineageOS/android_packages_apps_Car_SystemUI" />
+  <remove-project name="LineageOS/android_packages_services_Car" />
+  <remove-project name="platform/frameworks/opt/car/services" />
+  <remove-project name="platform/frameworks/opt/car/setupwizard" />
+  <remove-project name="platform/packages/apps/Car/CalendarPrebuilt" />
+  <remove-project name="platform/packages/apps/Car/Cluster" />
+  <remove-project name="platform/packages/apps/Car/DataSubscriptionReference" />
+  <remove-project name="platform/packages/apps/Car/DebuggingRestrictionController" />
+  <remove-project name="platform/packages/apps/Car/DialerPrebuilt" />
+  <remove-project name="platform/packages/apps/Car/DriverUIPrebuilt" />
+  <remove-project name="platform/packages/apps/Car/LatinIME" />
+  <remove-project name="platform/packages/apps/Car/Launcher" />
+  <remove-project name="platform/packages/apps/Car/LinkViewer" />
+  <remove-project name="platform/packages/apps/Car/LocalMediaPlayer" />
+  <remove-project name="platform/packages/apps/Car/MediaPrebuilt" />
+  <remove-project name="platform/packages/apps/Car/MessengerPrebuilt" />
+  <remove-project name="platform/packages/apps/Car/Notification" />
+  <remove-project name="platform/packages/apps/Car/Provision" />
+  <remove-project name="platform/packages/apps/Car/RadioPrebuilt" />
+  <remove-project name="platform/packages/apps/Car/RotaryController" />
+  <remove-project name="platform/packages/apps/Car/RotaryImePrebuilt" />
+  <remove-project name="platform/packages/apps/Car/SettingsIntelligence" />
+  <remove-project name="platform/packages/apps/Car/SystemUpdater" />
+  <remove-project name="platform/packages/apps/Car/Templates" />
+  <remove-project name="platform/packages/apps/Car/VoiceControl" />
+  <remove-project name="platform/packages/apps/Car/systemlibs" />
+  <remove-project name="LineageOS/android_device_google_atv" />
+  <remove-project name="LineageOS/android_device_google_contexthub" />
+  <remove-project name="LineageOS/android_packages_apps_TV" />
+
+  <!-- tier 3: run #12-#14 runner kills during soong bootstrap — shrink the
+       soong module graph. The 24 prebuilts/module_sdk/* prebuilt mainline SDKs
+       are not consumed by device builds (LOS builds modules from source), and
+       these two externals are unused by star2lte. -->
+  <remove-project name="platform/prebuilts/module_sdk/art" />
+  <remove-project name="platform/prebuilts/module_sdk/AdServices" />
+  <remove-project name="platform/prebuilts/module_sdk/AppSearch" />
+  <remove-project name="platform/prebuilts/module_sdk/Bluetooth" />
+  <remove-project name="platform/prebuilts/module_sdk/conscrypt" />
+  <remove-project name="platform/prebuilts/module_sdk/ConfigInfrastructure" />
+  <remove-project name="platform/prebuilts/module_sdk/Connectivity" />
+  <remove-project name="platform/prebuilts/module_sdk/CrashRecovery" />
+  <remove-project name="platform/prebuilts/module_sdk/DeviceLock" />
+  <remove-project name="platform/prebuilts/module_sdk/HealthFitness" />
+  <remove-project name="platform/prebuilts/module_sdk/IPsec" />
+  <remove-project name="platform/prebuilts/module_sdk/Media" />
+  <remove-project name="platform/prebuilts/module_sdk/MediaProvider" />
+  <remove-project name="platform/prebuilts/module_sdk/OnDevicePersonalization" />
+  <remove-project name="platform/prebuilts/module_sdk/Permission" />
+  <remove-project name="platform/prebuilts/module_sdk/Profiling" />
+  <remove-project name="platform/prebuilts/module_sdk/RemoteKeyProvisioning" />
+  <remove-project name="platform/prebuilts/module_sdk/Scheduling" />
+  <remove-project name="platform/prebuilts/module_sdk/SdkExtensions" />
+  <remove-project name="platform/prebuilts/module_sdk/StatsD" />
+  <remove-project name="platform/prebuilts/module_sdk/Uwb" />
+  <remove-project name="platform/prebuilts/module_sdk/Wifi" />
+  <remove-project name="platform/external/eigen" />
+  <remove-project name="platform/external/chromium-trace" />
+
+  <!-- tier 4: run #15 — trusty's lk.elf genrules need a dirgroup from
+       packages/modules/Virtualization (removed); the whole trusty stack is
+       unused by star2lte (device trees reference it zero times) — remove it
+       instead of restoring the 3.5G Virtualization tree. -->
+  <remove-project name="trusty/external/trusted-firmware-a" />
+  <remove-project name="trusty/external/trusty" />
+  <remove-project name="trusty/external/headers" />
+  <remove-project name="trusty/lk/common" />
+  <remove-project name="trusty/external/musl" />
+  <remove-project name="trusty/device/arm/generic-arm64" />
+  <remove-project name="trusty/device/arm/vexpress-a15" />
+  <remove-project name="trusty/device/nxp/imx7d" />
+  <remove-project name="trusty/device/x86/generic-x86_64" />
+  <remove-project name="trusty/lk/nxp" />
+  <remove-project name="trusty/host/common" />
+  <remove-project name="trusty/lk/trusty" />
+  <remove-project name="trusty/app/authmgr" />
+  <remove-project name="trusty/app/avb" />
+  <remove-project name="trusty/app/cast-auth" />
+  <remove-project name="trusty/app/confirmationui" />
+  <remove-project name="trusty/app/gatekeeper" />
+  <remove-project name="trusty/app/keymaster" />
+  <remove-project name="trusty/app/keymint" />
+  <remove-project name="trusty/app/sample" />
+  <remove-project name="trusty/app/secretkeeper" />
+  <remove-project name="trusty/app/storage" />
+  <remove-project name="trusty/lib" />
+  <remove-project name="trusty/vendor/google/aosp" />
+
+</manifest>
