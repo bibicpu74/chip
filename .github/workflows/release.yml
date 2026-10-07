@@ -226,120 +226,165 @@ jobs:
           echo "=== RBE LOG FILES ==="
           find /tmp/rbe-test -maxdepth 2 -type f -printf '%p\n' 2>/dev/null || true
 
-      - name: Find a real C++ compile edge
-        working-directory: /home/runner/work/los
+            - name: Find a real C++ compile target
+        shell: bash
         run: |
-          set -e
+          set -ex
 
-          if [ -x prebuilts/build-tools/linux-x86/bin/ninja ]; then
-            NINJA_BIN="$PWD/prebuilts/build-tools/linux-x86/bin/ninja"
-          elif command -v ninja >/dev/null 2>&1; then
-            NINJA_BIN="$(command -v ninja)"
-          else
-            echo "::error::Ninja executable not found."
-            exit 1
-          fi
-
-          echo "Using ninja: $NINJA_BIN"
-          "$NINJA_BIN" --version
-
-          echo "=== Ninja target count ==="
-          "$NINJA_BIN" -t targets all 2>&1 \
-            | tee /tmp/rbe-test/ninja-targets.txt | wc -l
-
-          echo "=== First targets ==="
-          head -100 /tmp/rbe-test/ninja-targets.txt || true
-
-          echo "=== Looking for C/C++ compile edges ==="
-          "$NINJA_BIN" -t commands 2>/dev/null \
-            | grep -E '(^|[[:space:];])(clang\+\+|clang|g\+\+|gcc)([[:space:]]|$)' \
-            | head -50 \
-            | tee /tmp/rbe-test/cxx-commands.txt || true
-
-          if [ ! -s /tmp/rbe-test/cxx-commands.txt ]; then
-            echo "::error::No C/C++ compile commands were found in the Ninja graph."
-            exit 1
-          fi
-
-          CXX_CMD="$(head -1 /tmp/rbe-test/cxx-commands.txt)"
-          echo "=== SELECTED C++ COMMAND ==="
-          printf '%s\n' "$CXX_CMD"
-
-          CXX_OUTPUT="$(
-            printf '%s\n' "$CXX_CMD" |
-              sed -nE 's/.*[[:space:]]-o[[:space:]]+([^[:space:]]+\.o)([[:space:]].*)?$/\1/p'
-          )"
-
-          if [ -z "$CXX_OUTPUT" ]; then
-            echo "::error::Could not extract an object output from selected compile command."
-            exit 1
-          fi
-
-          printf '%s\n' "$CXX_OUTPUT" > /tmp/rbe-test/cxx-target.txt
-          echo "=== SELECTED C++ OUTPUT ==="
-          cat /tmp/rbe-test/cxx-target.txt
-
-          echo "=== Mapping output to Ninja target ==="
-          TARGET_LINE="$(
-            grep -F "$CXX_OUTPUT" /tmp/rbe-test/ninja-targets.txt | head -1 || true
-          )"
-
-          if [ -z "$TARGET_LINE" ]; then
-            echo "::error::Could not map C++ output to a Ninja target."
-            exit 1
-          fi
-
-          # ninja -t targets output is generally: <target>: <rule>
-          TARGET="${TARGET_LINE%%:*}"
-          printf '%s\n' "$TARGET" > /tmp/rbe-test/ninja-target.txt
-
-          echo "=== SELECTED NINJA TARGET ==="
-          cat /tmp/rbe-test/ninja-target.txt
-
-          echo "=== COMMANDS FOR TARGET ==="
-          "$NINJA_BIN" -t commands "$TARGET" || true
-
-      - name: Execute ONE real C++ compile remotely
-        working-directory: /home/runner/work/los
-        timeout-minutes: 30
-        run: |
-          set -e
           source build/envsetup.sh
 
           export USE_RBE=1
-          export RBE_service="$RBE_SERVICE"
-          export RBE_DIR="$RBE_DIR"
-          export RBE_CXX_EXEC_STRATEGY=remote
-          export RBE_use_application_default_credentials=false
-          export RBE_remote_headers="$RBE_remote_headers"
-          export RBE_log_dir="$RBE_log_dir"
-          export RBE_proxy_log_dir="$RBE_proxy_log_dir"
-          export RBE_output_dir="$RBE_output_dir"
-          export NINJA_REMOTE_NUM_JOBS=1
+          export RBE_SERVICE="grpcs://remote.buildbuddy.io"
+          export RBE_DIR="prebuilts/remoteexecution-client/live"
+          export RBE_CXX_EXEC_STRATEGY="remote"
+          export RBE_use_application_default_credentials="false"
+          export RBE_remote_headers="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
+          export RBE_log_dir="/tmp/rbe-test"
+          export RBE_proxy_log_dir="/tmp/rbe-test"
+          export RBE_output_dir="/tmp/rbe-test"
+          export NINJA_REMOTE_NUM_JOBS="1"
 
-          TARGET="$(cat /tmp/rbe-test/ninja-target.txt)"
+          echo "=== TOP ==="
+          echo "$TOP"
 
-          if [ -x prebuilts/build-tools/linux-x86/bin/ninja ]; then
-            NINJA_BIN="$PWD/prebuilts/build-tools/linux-x86/bin/ninja"
-          else
-            NINJA_BIN="$(command -v ninja)"
+          echo "=== OUT_DIR ==="
+          echo "${OUT_DIR:-unset}"
+
+          echo "=== PRODUCT_OUT ==="
+          echo "${PRODUCT_OUT:-unset}"
+
+          echo "=== SOONG_OUT ==="
+          echo "${SOONG_OUT:-unset}"
+
+          echo "=== Checking Ninja files ==="
+
+          for f in \
+            "${OUT_DIR:-}/soong/build.ninja" \
+            "${TOP}/out/soong/build.ninja"
+          do
+            if [ -f "$f" ]; then
+              echo "FOUND: $f"
+              BUILD_NINJA="$f"
+              break
+            fi
+          done
+
+          if [ -z "${BUILD_NINJA:-}" ]; then
+            echo "::error::Soong build.ninja was not generated."
+            echo "=== out/ ==="
+            find "$TOP/out" -maxdepth 4 -type f -name 'build.ninja' -print 2>/dev/null || true
+            exit 1
           fi
 
-          echo "=============================================="
-          echo "RBE REAL COMPILE TEST"
-          echo "Target: ${TARGET}"
-          echo "Strategy: ${RBE_CXX_EXEC_STRATEGY}"
-          echo "Service: ${RBE_SERVICE}"
-          echo "Local fallback: DISABLED"
-          echo "=============================================="
+          echo "=== Using build.ninja ==="
+          echo "$BUILD_NINJA"
 
-          "$NINJA_BIN" -v -j1 "$TARGET" 2>&1 | tee /tmp/rbe-test/real-compile.log
+          NINJA_BIN="$TOP/prebuilts/build-tools/linux-x86/bin/ninja"
 
-          echo "=== COMPILE RESULT ==="
-          echo "Ninja completed target: $TARGET"
+          echo "=== Ninja version ==="
+          "$NINJA_BIN" --version
 
-          echo "=== RBE PROCESS CHECK ==="
-          ps aux | grep -E 'reproxy|rewrapper' | grep -v grep || true
+          NINJA_DIR="$(dirname "$BUILD_NINJA")"
+
+          echo "=== Ninja directory ==="
+          echo "$NINJA_DIR"
+
+          cd "$NINJA_DIR"
+
+          echo "=== Ninja targets ==="
+          "$NINJA_BIN" -t targets all 2>&1 \
+            | head -100 \
+            | tee /tmp/rbe-test/ninja-targets.txt
+
+          echo "=== Searching Ninja files for C/C++ compile edges ==="
+
+          grep -R -n -m 50 \
+            -E 'command = .*(/clang\+\+|/clang|/gcc|/g\+\+)( |$)' \
+            "$NINJA_DIR" \
+            --include='*.ninja' \
+            2>/dev/null \
+            | tee /tmp/rbe-test/cxx-edges.txt || true
+
+          if [ ! -s /tmp/rbe-test/cxx-edges.txt ]; then
+            echo "::error::No C/C++ compile rules were found in Soong Ninja files."
+            exit 1
+          fi
+
+          echo "=== C/C++ compile edges found ==="
+          head -20 /tmp/rbe-test/cxx-edges.txt
+
+          echo "=== Extracting first C++ object target ==="
+
+          CXX_OUTPUT="$(
+            head -1 /tmp/rbe-test/cxx-edges.txt |
+              sed -nE 's/.*build[[:space:]]+([^:]+):.*/\1/p'
+          )"
+
+          if [ -z "$CXX_OUTPUT" ]; then
+            echo "::error::Could not extract a C++ object target."
+            exit 1
+          fi
+
+          echo "CXX_OUTPUT=$CXX_OUTPUT"
+
+          echo "$CXX_OUTPUT" > /tmp/rbe-test/cxx-target.txt
+
+          echo "=== Selected target ==="
+          cat /tmp/rbe-test/cxx-target.txt
+
+      - name: Execute one real C++ compile
+        shell: bash
+        run: |
+          set -ex
+
+          source build/envsetup.sh
+
+          export USE_RBE=1
+          export RBE_SERVICE="grpcs://remote.buildbuddy.io"
+          export RBE_DIR="prebuilts/remoteexecution-client/live"
+          export RBE_CXX_EXEC_STRATEGY="remote"
+          export RBE_use_application_default_credentials="false"
+          export RBE_remote_headers="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
+          export RBE_log_dir="/tmp/rbe-test"
+          export RBE_proxy_log_dir="/tmp/rbe-test"
+          export RBE_output_dir="/tmp/rbe-test"
+          export NINJA_REMOTE_NUM_JOBS="1"
+
+          TARGET="$(cat /tmp/rbe-test/cxx-target.txt)"
+
+          echo "=== Target ==="
+          echo "$TARGET"
+
+          if [ -z "$TARGET" ]; then
+            echo "::error::Empty C++ target."
+            exit 1
+          fi
+
+          if [ -n "${OUT_DIR:-}" ] && [ -f "$OUT_DIR/soong/build.ninja" ]; then
+            BUILD_NINJA="$OUT_DIR/soong/build.ninja"
+          else
+            BUILD_NINJA="$TOP/out/soong/build.ninja"
+          fi
+
+          if [ ! -f "$BUILD_NINJA" ]; then
+            echo "::error::build.ninja not found: $BUILD_NINJA"
+            exit 1
+          fi
+
+          NINJA_DIR="$(dirname "$BUILD_NINJA")"
+          NINJA_BIN="$TOP/prebuilts/build-tools/linux-x86/bin/ninja"
+
+          cd "$NINJA_DIR"
+
+          echo "=== Running real C++ compile ==="
+
+          "$NINJA_BIN" -v -j1 "$TARGET" \
+            2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
+
+          echo "=== Compile finished ==="
+
+          echo "=== RBE logs ==="
+          find /tmp/rbe-test -maxdepth 2 -type f -print | sort || true
 
       - name: Verify RBE activity
         if: always()
