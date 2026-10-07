@@ -293,4 +293,23 @@
   <remove-project name="platform/tools/loganalysis" />
   <remove-project name="platform/tools/acloud" />
 
+  <!-- ===== tier 7: CI-only CTS / MTS compatibility defaults =====
+       platform/cts intentionally remains removed to keep the GitHub runner tree
+       small. Some runtime repositories (Connectivity, DeviceLock, Profiling,
+       build/bazel examples, etc.) still contain CTS/MTS test Android.bp stanzas,
+       and Soong parses those stanzas even when the tests are never selected for
+       the star2lte ROM.
+
+       The GitHub Actions workflow therefore creates ci-diet/Android.bp after
+       repo sync with tiny java_defaults stubs for:
+         - cts_error_prone_rules
+         - cts_error_prone_rules_tests
+         - cts_support_defaults
+         - cts_defaults
+         - mts-target-sdk-version-current
+
+       These stubs exist only to let Soong resolve the graph. They do NOT restore
+       CTS/MTS, do NOT add tests to the product, and do NOT package test artifacts.
+       Keep platform/cts removed unless a real runtime dependency proves otherwise. -->
+
 </manifest>
