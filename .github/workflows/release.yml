@@ -226,7 +226,7 @@ jobs:
           echo "=== RBE LOG FILES ==="
           find /tmp/rbe-test -maxdepth 2 -type f -printf '%p\n' 2>/dev/null || true
 
-            - name: Find a real C++ compile target
+      - name: Find a real C++ compile target
         shell: bash
         run: |
           set -ex
