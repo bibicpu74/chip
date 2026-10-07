@@ -141,7 +141,7 @@ jobs:
           export NINJA_REMOTE_NUM_JOBS="$NINJA_REMOTE_NUM_JOBS"
 
           breakfast star2lte userdebug
-          lunch star2lte lineage-22.2 userdebug
+          lunch star2lte-lineage-22.2-userdebug
 
           echo "TARGET_PRODUCT=${TARGET_PRODUCT:-unset}"
           echo "TARGET_RELEASE=${TARGET_RELEASE:-unset}"
@@ -173,7 +173,7 @@ jobs:
           export RBE_proxy_log_dir="$RBE_proxy_log_dir"
           export RBE_output_dir="$RBE_output_dir"
           export NINJA_REMOTE_NUM_JOBS="$NINJA_REMOTE_NUM_JOBS"
-          lunch star2lte lineage-22.2 userdebug
+          lunch star2lte-lineage-22.2-userdebug
 
           echo "TARGET_PRODUCT=${TARGET_PRODUCT}"
           echo "TARGET_RELEASE=${TARGET_RELEASE}"
@@ -202,7 +202,7 @@ jobs:
           export RBE_proxy_log_dir="$RBE_proxy_log_dir"
           export RBE_output_dir="$RBE_output_dir"
           export NINJA_REMOTE_NUM_JOBS="$NINJA_REMOTE_NUM_JOBS"
-          lunch star2lte lineage-22.2 userdebug
+          lunch star2lte-lineage-22.2-userdebug
 
           BUILD_NINJA="$(find "$TOP/out" -type f -name build.ninja | head -1)"
           test -n "$BUILD_NINJA"
@@ -245,7 +245,7 @@ jobs:
           export RBE_proxy_log_dir="$RBE_proxy_log_dir"
           export RBE_output_dir="$RBE_output_dir"
           export NINJA_REMOTE_NUM_JOBS="$NINJA_REMOTE_NUM_JOBS"
-          lunch star2lte lineage-22.2 userdebug
+          lunch star2lte-lineage-22.2-userdebug
 
           BUILD_NINJA="$(find "$TOP/out" -type f -name build.ninja | head -1)"
           test -n "$BUILD_NINJA"
