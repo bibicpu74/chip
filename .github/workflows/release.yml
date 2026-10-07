@@ -1,530 +1,571 @@
-name: LineageOS 22.2 - BuildBuddy RBE Test
+name: LineageOS 22.2 - BuildBuddy RBE Real Compile Test
 
 on:
-  workflow_dispatch:
+workflow_dispatch:
 
 concurrency:
-  group: los22-star2lte-rbe-test
-  cancel-in-progress: true
+group: los22-star2lte-rbe-real-test
+cancel-in-progress: true
 
 jobs:
-  rbe-test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
+rbe-test:
+runs-on: ubuntu-24.04
+timeout-minutes: 120
 
+env:
+  BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+  RBE_SERVICE: grpcs://remote.buildbuddy.io
+
+steps:
+
+  # ============================================================
+  # 1. Reclaim disk
+  # ============================================================
+
+  - name: Reclaim root disk
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      sudo swapoff -a || true
+      sudo rm -f /swapfile /mnt/swapfile || true
+
+      sudo rm -rf \
+        /usr/local/lib/android \
+        /usr/share/dotnet \
+        /opt/ghc \
+        /usr/local/.ghcup \
+        /opt/hostedtoolcache/CodeQL \
+        /usr/local/share/boost || true
+
+      sudo docker image prune -a -f >/dev/null 2>&1 || true
+
+      mkdir -p /home/runner/work/los
+
+      echo "=== Disk ==="
+      df -h /
+
+  # ============================================================
+  # 2. Checkout local manifest repository
+  # ============================================================
+
+  - name: Checkout local manifest
+    uses: actions/checkout@v4
+    with:
+      path: repo-config
+
+  # ============================================================
+  # 3. Install dependencies
+  # ============================================================
+
+  - name: Install build dependencies
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      sudo apt-get update
+
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        bc \
+        bison \
+        build-essential \
+        ccache \
+        curl \
+        flex \
+        g++-multilib \
+        gcc-multilib \
+        git \
+        git-lfs \
+        gnupg \
+        gperf \
+        imagemagick \
+        lib32readline-dev \
+        lib32z1-dev \
+        libelf-dev \
+        liblz4-tool \
+        libsdl1.2-dev \
+        libssl-dev \
+        libxml2 \
+        libxml2-utils \
+        lzop \
+        ninja-build \
+        pngcrush \
+        rsync \
+        schedtool \
+        squashfs-tools \
+        xsltproc \
+        zip \
+        zlib1g-dev \
+        python3 \
+        python-is-python3 \
+        openjdk-21-jdk-headless
+
+      mkdir -p "$HOME/bin"
+
+      curl -fsSL \
+        https://storage.googleapis.com/git-repo-downloads/repo \
+        -o "$HOME/bin/repo"
+
+      chmod a+x "$HOME/bin/repo"
+
+      echo "$HOME/bin" >> "$GITHUB_PATH"
+
+  # ============================================================
+  # 4. Validate BuildBuddy secret
+  # ============================================================
+
+  - name: Check BuildBuddy configuration
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      echo "========================================"
+      echo " BuildBuddy configuration"
+      echo "========================================"
+
+      echo "RBE_SERVICE=${RBE_SERVICE}"
+
+      if [ -z "${BUILDBUDDY_API_KEY:-}" ]; then
+        echo "::error::BUILDBUDDY_API_KEY GitHub Secret is missing"
+        exit 1
+      fi
+
+      echo "[OK] BUILDBUDDY_API_KEY is configured"
+
+  # ============================================================
+  # 5. Repo init
+  # ============================================================
+
+  - name: Repo init
+    working-directory: /home/runner/work/los
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      git config --global user.email "ci@local"
+      git config --global user.name "ci"
+      git config --global color.ui false
+
+      repo init \
+        --depth=1 \
+        -u https://github.com/LineageOS/android.git \
+        -b lineage-22.2
+
+      mkdir -p .repo/local_manifests
+
+      cp \
+        "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml" \
+        .repo/local_manifests/star2lte.xml
+
+      test -f .repo/local_manifests/star2lte.xml
+
+      echo "[OK] Local manifest installed"
+
+  # ============================================================
+  # 6. Repo sync
+  # ============================================================
+
+  - name: Repo sync
+    working-directory: /home/runner/work/los
+    shell: bash
+    timeout-minutes: 70
+    run: |
+      set -euo pipefail
+
+      echo "========================================"
+      echo " LineageOS repo sync"
+      echo "========================================"
+
+      repo sync \
+        -c \
+        --no-clone-bundle \
+        --no-tags \
+        --optimized-fetch \
+        --prune \
+        -j"$(nproc)"
+
+      echo
+      echo "=== Disk after sync ==="
+      df -h / /home/runner/work/los
+
+  # ============================================================
+  # 7. Inspect reclient
+  # ============================================================
+
+  - name: Inspect AOSP reclient
+    working-directory: /home/runner/work/los
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      RBE_DIR="$PWD/prebuilts/remoteexecution-client/live"
+
+      echo "========================================"
+      echo " AOSP reclient"
+      echo "========================================"
+
+      echo "RBE_DIR=$RBE_DIR"
+
+      test -d "$RBE_DIR" || {
+        echo "::error::AOSP reclient directory does not exist"
+        exit 1
+      }
+
+      test -x "$RBE_DIR/reproxy" || {
+        echo "::error::reproxy missing or not executable"
+        exit 1
+      }
+
+      test -x "$RBE_DIR/rewrapper" || {
+        echo "::error::rewrapper missing or not executable"
+        exit 1
+      }
+
+      echo
+      echo "=== reproxy version/help ==="
+      "$RBE_DIR/reproxy" --help 2>&1 | head -100 || true
+
+      echo
+      echo "=== rewrapper help ==="
+      "$RBE_DIR/rewrapper" --help 2>&1 | head -150 || true
+
+      echo
+      echo "=== reclient files ==="
+      find "$PWD/prebuilts/remoteexecution-client" \
+        -maxdepth 4 \
+        -type f \
+        \( \
+          -name "*.cfg" \
+          -o -name "*.textproto" \
+          -o -name "*.json" \
+          -o -name "*.proto" \
+        \) \
+        -print | sort || true
+
+  # ============================================================
+  # 8. BuildBuddy connectivity
+  # ============================================================
+
+  - name: Test BuildBuddy connectivity
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      echo "========================================"
+      echo " BuildBuddy connectivity"
+      echo "========================================"
+
+      echo
+      echo "=== DNS ==="
+      getent hosts remote.buildbuddy.io
+
+      echo
+      echo "=== HTTPS API ==="
+
+      HTTP_CODE="$(
+        curl \
+          --silent \
+          --show-error \
+          --output /tmp/buildbuddy-response \
+          --write-out '%{http_code}' \
+          --max-time 20 \
+          -H "x-buildbuddy-api-key: ${BUILDBUDDY_API_KEY}" \
+          https://app.buildbuddy.io/
+      )"
+
+      echo "HTTP status: ${HTTP_CODE}"
+
+      if [ "$HTTP_CODE" -ge 400 ]; then
+        echo "::error::BuildBuddy HTTPS returned HTTP ${HTTP_CODE}"
+        cat /tmp/buildbuddy-response || true
+        exit 1
+      fi
+
+      echo "[OK] BuildBuddy API key accepted by HTTPS endpoint"
+
+  # ============================================================
+  # 9. Prepare Android environment
+  # ============================================================
+
+  - name: Breakfast star2lte
+    working-directory: /home/runner/work/los
+    shell: bash
+    env:
+      ALLOW_MISSING_DEPENDENCIES: "true"
+    run: |
+      set -euo pipefail
+
+      echo "========================================"
+      echo " Android build environment"
+      echo "========================================"
+
+      source build/envsetup.sh
+
+      breakfast star2lte userdebug
+
+  # ============================================================
+  # 10. Configure REAL RBE
+  # ============================================================
+
+  - name: Configure real RBE
+    working-directory: /home/runner/work/los
+    shell: bash
     env:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-      RBE_SERVICE: grpcs://remote.buildbuddy.io
+    run: |
+      set -euo pipefail
 
-    steps:
+      RBE_DIR="$PWD/prebuilts/remoteexecution-client/live"
 
-      # ============================================================
-      # 1. Reclaim disk
-      # ============================================================
+      mkdir -p /tmp/rbe-test
 
-      - name: Reclaim root disk
-        shell: bash
-        run: |
-          set -euo pipefail
+      cat > /tmp/rbe-env.sh <<EOF
+      export USE_RBE=1
+      export RBE_DIR="$RBE_DIR"
 
-          sudo swapoff -a || true
-          sudo rm -f /swapfile /mnt/swapfile || true
+      export RBE_service="grpcs://remote.buildbuddy.io"
 
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL \
-            /usr/local/share/boost || true
+      # BuildBuddy authentication.
+      #
+      # reclient supports custom remote headers.
+      # The API key is NEVER printed.
+      export RBE_remote_headers="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
 
-          sudo docker image prune -a -f >/dev/null 2>&1 || true
+      # IMPORTANT:
+      # Do NOT use fallback for the real compile test.
+      # If remote execution fails, the compile must fail.
+      export RBE_CXX_EXEC_STRATEGY="remote"
 
-          mkdir -p /home/runner/work/los
+      export RBE_JAVAC_EXEC_STRATEGY="remote_local_fallback"
+      export RBE_R8_EXEC_STRATEGY="remote_local_fallback"
+      export RBE_D8_EXEC_STRATEGY="remote_local_fallback"
 
-          echo "=== Disk ==="
-          df -h /
+      export RBE_JAVAC=1
+      export RBE_R8=1
+      export RBE_D8=1
 
-      # ============================================================
-      # 2. Checkout local manifest repository
-      # ============================================================
+      export RBE_log_dir="/tmp/rbe-test"
+      export RBE_proxy_log_dir="/tmp/rbe-test"
+      export RBE_output_dir="/tmp/rbe-test"
 
-      - name: Checkout local manifest
-        uses: actions/checkout@v4
-        with:
-          path: repo-config
+      export NINJA_REMOTE_NUM_JOBS=1
+      EOF
 
-      # ============================================================
-      # 3. Install dependencies
-      # ============================================================
+      chmod 600 /tmp/rbe-env.sh
 
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
+      echo "========================================"
+      echo " RBE configuration"
+      echo "========================================"
 
-          sudo apt-get update
+      echo "RBE_DIR=$RBE_DIR"
+      echo "RBE_service=grpcs://remote.buildbuddy.io"
+      echo "RBE_CXX_EXEC_STRATEGY=remote"
+      echo "RBE_remote_headers=x-buildbuddy-api-key=<redacted>"
+      echo "NINJA_REMOTE_NUM_JOBS=1"
 
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            bc \
-            bison \
-            build-essential \
-            ccache \
-            curl \
-            flex \
-            g++-multilib \
-            gcc-multilib \
-            git \
-            git-lfs \
-            gnupg \
-            gperf \
-            imagemagick \
-            lib32readline-dev \
-            lib32z1-dev \
-            libelf-dev \
-            liblz4-tool \
-            libsdl1.2-dev \
-            libssl-dev \
-            libxml2 \
-            libxml2-utils \
-            lzop \
-            ninja-build \
-            pngcrush \
-            rsync \
-            schedtool \
-            squashfs-tools \
-            xsltproc \
-            zip \
-            zlib1g-dev \
-            python3 \
-            python-is-python3 \
-            openjdk-21-jdk-headless
+  # ============================================================
+  # 11. REAL C++ compile through Soong/RBE
+  # ============================================================
 
-          mkdir -p "$HOME/bin"
+  - name: Real RBE C++ compile test
+    working-directory: /home/runner/work/los
+    shell: bash
+    env:
+      ALLOW_MISSING_DEPENDENCIES: "true"
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      USE_RBE: "1"
+      RBE_DIR: /home/runner/work/los/prebuilts/remoteexecution-client/live
+      RBE_service: grpcs://remote.buildbuddy.io
+      RBE_remote_headers: x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_API_KEY }}
+      RBE_CXX_EXEC_STRATEGY: remote
+      RBE_JAVAC_EXEC_STRATEGY: remote_local_fallback
+      RBE_R8_EXEC_STRATEGY: remote_local_fallback
+      RBE_D8_EXEC_STRATEGY: remote_local_fallback
+      RBE_JAVAC: "1"
+      RBE_R8: "1"
+      RBE_D8: "1"
+      RBE_log_dir: /tmp/rbe-test
+      RBE_proxy_log_dir: /tmp/rbe-test
+      RBE_output_dir: /tmp/rbe-test
+      NINJA_REMOTE_NUM_JOBS: "1"
+    run: |
+      set -uo pipefail
 
-          curl -fsSL \
-            https://storage.googleapis.com/git-repo-downloads/repo \
-            -o "$HOME/bin/repo"
+      mkdir -p /tmp/rbe-test
 
-          chmod a+x "$HOME/bin/repo"
+      source build/envsetup.sh
 
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+      echo "========================================"
+      echo " REAL BUILDbuddy RBE COMPILE TEST"
+      echo "========================================"
 
-      # ============================================================
-      # 4. Validate BuildBuddy secret
-      # ============================================================
+      echo
+      echo "This test will:"
+      echo "  - generate the Android build graph"
+      echo "  - execute C++ compilation remotely"
+      echo "  - use BuildBuddy API-key authentication"
+      echo "  - use ONLY ONE remote job"
+      echo "  - NOT build bacon"
+      echo
 
-      - name: Check BuildBuddy configuration
-        shell: bash
-        run: |
-          set -euo pipefail
+      echo "=== RBE environment ==="
+      echo "USE_RBE=$USE_RBE"
+      echo "RBE_DIR=$RBE_DIR"
+      echo "RBE_service=$RBE_service"
+      echo "RBE_CXX_EXEC_STRATEGY=$RBE_CXX_EXEC_STRATEGY"
+      echo "RBE_remote_headers=<redacted>"
+      echo "NINJA_REMOTE_NUM_JOBS=$NINJA_REMOTE_NUM_JOBS"
 
-          echo "========================================"
-          echo " BuildBuddy configuration"
-          echo "========================================"
+      echo
+      echo "=== Starting reproxy through Soong ==="
 
-          echo "RBE_SERVICE=${RBE_SERVICE}"
+      set +e
 
-          if [ -z "${BUILDBUDDY_API_KEY:-}" ]; then
-            echo "::error::BUILDBUDDY_API_KEY GitHub Secret is missing"
-            exit 1
-          fi
+      # Build only a small C++ target.
+      #
+      # The exact target is discovered from the star2lte product graph.
+      # Nothing related to bacon/ROM packaging is requested here.
+      m \
+        -j1 \
+        --skip-make \
+        2>&1 | tee /tmp/rbe-test/soong-generation.log
 
-          echo "API key: configured"
+      GENERATE_STATUS=${PIPESTATUS[0]}
 
-      # ============================================================
-      # 5. repo init
-      # ============================================================
+      set -e
 
-      - name: Repo init
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -euo pipefail
+      echo
+      echo "Soong generation status: $GENERATE_STATUS"
 
-          git config --global user.email "ci@local"
-          git config --global user.name "ci"
-          git config --global color.ui false
+      if [ "$GENERATE_STATUS" -ne 0 ]; then
+        echo "::error::Soong generation failed"
+        exit "$GENERATE_STATUS"
+      fi
 
-          repo init \
-            --depth=1 \
-            -u https://github.com/LineageOS/android.git \
-            -b lineage-22.2
+      echo
+      echo "=== Finding small C++ ninja targets ==="
 
-          mkdir -p .repo/local_manifests
+      if [ ! -f build.ninja ]; then
+        echo "::error::build.ninja was not generated"
+        exit 1
+      fi
 
-          cp \
-            "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml" \
-            .repo/local_manifests/star2lte.xml
+      grep -n "build .*\.o:" build.ninja \
+        | head -20 \
+        | tee /tmp/rbe-test/cxx-targets.txt || true
 
-          test -f .repo/local_manifests/star2lte.xml
+      echo
+      echo "=== Running ONE C++ compilation action ==="
 
-          echo "Local manifest installed."
+      set +e
 
-      # ============================================================
-      # 6. repo sync
-      # ============================================================
+      # Ask Ninja to build the first C++ object found in the generated graph.
+      #
+      # The target is extracted from build.ninja rather than hard-coded,
+      # because Android/Soong target names vary between source revisions.
+      CXX_TARGET="$(
+        awk '
+          /^build / && /\.o:/ {
+            target=$2
+            gsub(/^\[/, "", target)
+            gsub(/\]$/, "", target)
+            print target
+            exit
+          }
+        ' build.ninja
+      )"
 
-      - name: Repo sync
-        working-directory: /home/runner/work/los
-        shell: bash
-        timeout-minutes: 70
-        run: |
-          set -euo pipefail
+      echo "Selected target: ${CXX_TARGET:-<none>}"
 
-          echo "========================================"
-          echo " LineageOS repo sync"
-          echo "========================================"
+      if [ -z "${CXX_TARGET:-}" ]; then
+        echo "::error::Could not find a C++ object target in build.ninja"
+        exit 1
+      fi
 
-          repo sync \
-            -c \
-            --no-clone-bundle \
-            --no-tags \
-            --optimized-fetch \
-            --prune \
-            -j"$(nproc)"
+      NINJA_STATUS=0
 
+      ninja -j1 "$CXX_TARGET" \
+        2>&1 | tee /tmp/rbe-test/real-compile.log
+
+      NINJA_STATUS=${PIPESTATUS[0]}
+
+      set -e
+
+      echo
+      echo "Ninja compile status: $NINJA_STATUS"
+
+      if [ "$NINJA_STATUS" -ne 0 ]; then
+        echo
+        echo "::error::REAL RBE C++ compile failed."
+        echo "::error::Because RBE_CXX_EXEC_STRATEGY=remote, this was NOT allowed to fall back to local execution."
+        exit "$NINJA_STATUS"
+      fi
+
+      echo
+      echo "========================================"
+      echo " REAL RBE COMPILE PASSED"
+      echo "========================================"
+
+  # ============================================================
+  # 12. Verify reproxy actually contacted BuildBuddy
+  # ============================================================
+
+  - name: Verify RBE logs
+    if: always()
+    working-directory: /home/runner/work/los
+    shell: bash
+    run: |
+      set +e
+
+      echo "========================================"
+      echo " RBE verification"
+      echo "========================================"
+
+      echo
+      echo "=== RBE files ==="
+      find /tmp/rbe-test \
+        -maxdepth 3 \
+        -type f \
+        -print \
+        | sort || true
+
+      echo
+      echo "=== Remote execution indicators ==="
+
+      grep -RniE \
+        'remote|execute|execution|buildbuddy|authenticated|header|x-buildbuddy|permission|unauthenticated|denied|error' \
+        /tmp/rbe-test \
+        2>/dev/null \
+        | tail -200 || true
+
+      echo
+      echo "=== reproxy log content ==="
+
+      for f in \
+        /tmp/rbe-test/*reproxy* \
+        /tmp/rbe-test/*.log \
+        /tmp/rbe-test/*.txt
+      do
+        if [ -f "$f" ]; then
           echo
-          echo "=== Disk after sync ==="
-          df -h / /home/runner/work/los
-
-      # ============================================================
-      # 7. Verify AOSP reclient
-      # ============================================================
-
-      - name: Inspect AOSP reclient
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo " AOSP reclient"
-          echo "========================================"
-
-          RBE_DIR="$PWD/prebuilts/remoteexecution-client/live"
-
-          echo "RBE_DIR=$RBE_DIR"
-
-          if [ ! -d "$RBE_DIR" ]; then
-            echo "::error::AOSP reclient directory does not exist"
-            echo "$RBE_DIR"
-            exit 1
-          fi
-
-          echo
-          echo "=== Directory ==="
-          ls -lah "$RBE_DIR"
-
-          echo
-          echo "=== reproxy ==="
-
-          if [ ! -x "$RBE_DIR/reproxy" ]; then
-            echo "::error::reproxy missing or not executable"
-            exit 1
-          fi
-
-          "$RBE_DIR/reproxy" --help | head -100 || true
-
-          echo
-          echo "=== rewrapper ==="
-
-          if [ ! -x "$RBE_DIR/rewrapper" ]; then
-            echo "::error::rewrapper missing or not executable"
-            exit 1
-          fi
-
-          "$RBE_DIR/rewrapper" --help | head -100 || true
-
-          echo
-          echo "=== RBE-related files ==="
-
-          find "$PWD/prebuilts/remoteexecution-client" \
-            -maxdepth 4 \
-            -type f \
-            \( \
-              -name "*.cfg" \
-              -o -name "*.textproto" \
-              -o -name "*.json" \
-              -o -name "*.proto" \
-            \) \
-            -print | sort || true
-
-      # ============================================================
-      # 8. Test BuildBuddy network
-      # ============================================================
-
-      - name: Test BuildBuddy network
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo " BuildBuddy network"
-          echo "========================================"
-
-          echo
-          echo "=== DNS ==="
-
-          getent hosts remote.buildbuddy.io
-
-          echo
-          echo "=== HTTPS API ==="
-
-          HTTP_CODE="$(
-            curl \
-              --silent \
-              --show-error \
-              --output /tmp/buildbuddy-response \
-              --write-out '%{http_code}' \
-              --max-time 20 \
-              -H "x-buildbuddy-api-key: ${BUILDBUDDY_API_KEY}" \
-              https://app.buildbuddy.io/
-          )"
-
-          echo "HTTP status: ${HTTP_CODE}"
-
-          if [ "$HTTP_CODE" -ge 500 ]; then
-            echo "::error::BuildBuddy HTTPS returned HTTP ${HTTP_CODE}"
-            cat /tmp/buildbuddy-response || true
-            exit 1
-          fi
-
-          echo "[OK] BuildBuddy HTTPS reachable."
-
-      # ============================================================
-      # 9. Prepare Android build environment
-      # ============================================================
-
-      - name: Breakfast star2lte
-        working-directory: /home/runner/work/los
-        shell: bash
-        env:
-          ALLOW_MISSING_DEPENDENCIES: "true"
-        run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo " Android build environment"
-          echo "========================================"
-
-          source build/envsetup.sh
-
-          breakfast star2lte userdebug
-
-      # ============================================================
-      # 10. Configure RBE
-      # ============================================================
-
-      - name: Configure RBE
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo " Configure BuildBuddy RBE"
-          echo "========================================"
-
-          export USE_RBE=1
-
-          export RBE_DIR="$PWD/prebuilts/remoteexecution-client/live"
-
-          export RBE_service="${RBE_SERVICE}"
-
-          export RBE_CXX_EXEC_STRATEGY=remote_local_fallback
-          export RBE_JAVAC_EXEC_STRATEGY=remote_local_fallback
-          export RBE_R8_EXEC_STRATEGY=remote_local_fallback
-          export RBE_D8_EXEC_STRATEGY=remote_local_fallback
-
-          export RBE_JAVAC=1
-          export RBE_R8=1
-          export RBE_D8=1
-
-          export RBE_log_dir=/tmp/rbe-test
-          export RBE_proxy_log_dir=/tmp/rbe-test
-          export RBE_output_dir=/tmp/rbe-test
-
-          mkdir -p /tmp/rbe-test
-
-          echo "USE_RBE=$USE_RBE"
-          echo "RBE_DIR=$RBE_DIR"
-          echo "RBE_service=$RBE_service"
-          echo "RBE_CXX_EXEC_STRATEGY=$RBE_CXX_EXEC_STRATEGY"
-          echo "RBE_JAVAC_EXEC_STRATEGY=$RBE_JAVAC_EXEC_STRATEGY"
-          echo "RBE_R8_EXEC_STRATEGY=$RBE_R8_EXEC_STRATEGY"
-          echo "RBE_D8_EXEC_STRATEGY=$RBE_D8_EXEC_STRATEGY"
-
-          echo
-          echo "IMPORTANT:"
-          echo "BUILDBUDDY_API_KEY is present in the GitHub environment,"
-          echo "but it is NOT printed and is NOT written to the source tree."
-
-      # ============================================================
-      # 11. RBE smoke test through Soong/Ninja
-      # ============================================================
-
-      - name: RBE smoke test
-        working-directory: /home/runner/work/los
-        shell: bash
-        env:
-          ALLOW_MISSING_DEPENDENCIES: "true"
-
-          USE_RBE: "1"
-          RBE_DIR: /home/runner/work/los/prebuilts/remoteexecution-client/live
-          RBE_service: grpcs://remote.buildbuddy.io
-
-          RBE_CXX_EXEC_STRATEGY: remote_local_fallback
-          RBE_JAVAC_EXEC_STRATEGY: remote_local_fallback
-          RBE_R8_EXEC_STRATEGY: remote_local_fallback
-          RBE_D8_EXEC_STRATEGY: remote_local_fallback
-
-          RBE_JAVAC: "1"
-          RBE_R8: "1"
-          RBE_D8: "1"
-
-          RBE_log_dir: /tmp/rbe-test
-          RBE_proxy_log_dir: /tmp/rbe-test
-          RBE_output_dir: /tmp/rbe-test
-
-          NINJA_REMOTE_NUM_JOBS: "1"
-
-        run: |
-          set -uo pipefail
-
-          echo "========================================"
-          echo " REAL RBE SMOKE TEST"
-          echo "========================================"
-
-          mkdir -p /tmp/rbe-test
-
-          source build/envsetup.sh
-
-          export USE_RBE=1
-          export RBE_DIR="$PWD/prebuilts/remoteexecution-client/live"
-          export RBE_service="grpcs://remote.buildbuddy.io"
-
-          export RBE_CXX_EXEC_STRATEGY=remote_local_fallback
-          export RBE_JAVAC_EXEC_STRATEGY=remote_local_fallback
-          export RBE_R8_EXEC_STRATEGY=remote_local_fallback
-          export RBE_D8_EXEC_STRATEGY=remote_local_fallback
-
-          export RBE_JAVAC=1
-          export RBE_R8=1
-          export RBE_D8=1
-
-          export RBE_log_dir=/tmp/rbe-test
-          export RBE_proxy_log_dir=/tmp/rbe-test
-          export RBE_output_dir=/tmp/rbe-test
-
-          export NINJA_REMOTE_NUM_JOBS=1
-
-          echo
-          echo "=== Effective RBE environment ==="
-
-          env | grep '^RBE_' | sort || true
-          echo "USE_RBE=$USE_RBE"
-          echo "NINJA_REMOTE_NUM_JOBS=$NINJA_REMOTE_NUM_JOBS"
-
-          echo
-          echo "=== Generating Soong ==="
-
-          set +e
-
-          m nothing 2>&1 | tee /tmp/rbe-test/soong-smoke.log
-
-          STATUS=${PIPESTATUS[0]}
-
-          set -e
-
-          echo
-          echo "Soong exit status: $STATUS"
-
-          echo
-          echo "========================================"
-          echo " RBE LOGS"
-          echo "========================================"
-
-          find /tmp/rbe-test -maxdepth 2 -type f -print \
-            | sort || true
-
-          echo
-          echo "=== reproxy log candidates ==="
-
-          find /tmp/rbe-test \
-            -type f \
-            \( \
-              -iname "*reproxy*" \
-              -o -iname "*rbe*" \
-              -o -iname "*.log" \
-            \) \
-            -print \
-            | sort || true
-
-          echo
-          echo "=== Recent RBE log content ==="
-
-          for f in $(find /tmp/rbe-test -type f \( -name "*.log" -o -name "*reproxy*" \) 2>/dev/null | head -20); do
-            echo
-            echo "----- $f -----"
-            tail -100 "$f" || true
-          done
-
-          if [ "$STATUS" -ne 0 ]; then
-            echo
-            echo "::error::RBE smoke test failed."
-            echo "This is NOT a successful RBE test."
-            exit "$STATUS"
-          fi
-
-          echo
-          echo "========================================"
-          echo " RBE SMOKE TEST COMMAND PASSED"
-          echo "========================================"
-          echo
-          echo "NOTE:"
-          echo "This confirms that the Soong RBE path was usable"
-          echo "for this invocation."
-          echo "Check the reproxy logs above for remote execution"
-          echo "and authentication details."
-
-      # ============================================================
-      # 12. Always collect RBE logs
-      # ============================================================
-
-      - name: Collect RBE diagnostics
-        if: always()
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          echo "========================================"
-          echo " RBE diagnostic files"
-          echo "========================================"
-
-          mkdir -p /tmp/rbe-final
-
-          cp -a /tmp/rbe-test/. /tmp/rbe-final/ 2>/dev/null || true
-
-          echo
-          echo "=== RBE directory ==="
-          ls -lah prebuilts/remoteexecution-client/live \
-            2>/dev/null || true
-
-          echo
-          echo "=== Disk ==="
-          df -h / /home/runner/work/los \
-            2>/dev/null || true
-
-      # ============================================================
-      # 13. Upload diagnostics
-      # ============================================================
-
-      - name: Upload RBE diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: buildbuddy-rbe-diagnostics
-          path: /tmp/rbe-final/*
-          if-no-files-found: warn
-          retention-days: 7
+          echo "----- $f -----"
+          tail -200 "$f" || true
+        fi
+      done
+
+      echo
+      echo "=== Final disk ==="
+      df -h / /home/runner/work/los || true
+
+  # ============================================================
+  # 13. Always upload diagnostics
+  # ============================================================
+
+  - name: Upload RBE diagnostics
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: buildbuddy-rbe-real-compile-diagnostics
+      path: /tmp/rbe-test/*
+      if-no-files-found: warn
+      retention-days: 7
