@@ -3,6 +3,9 @@ name: LineageOS 22.2 - BuildBuddy RBE Real Compile Test
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: los22-star2lte-rbe-real-test
   cancel-in-progress: true
@@ -14,27 +17,56 @@ jobs:
 
     env:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
-      RBE_SERVICE: "grpcs://remote.buildbuddy.io"
+
+      # Android / Soong RBE
+      USE_RBE: "1"
       RBE_DIR: "prebuilts/remoteexecution-client/live"
       RBE_CXX_EXEC_STRATEGY: "remote"
+
+      # reclient expects host:port here, not a Bazel-style grpcs:// URL.
+      RBE_service: "remote.buildbuddy.io:443"
+
+      # BuildBuddy authenticates with the x-buildbuddy-api-key gRPC metadata
+      # header. Disable Google ADC / per-RPC Google credentials.
       RBE_use_application_default_credentials: "false"
+      RBE_use_rpc_credentials: "false"
+      RBE_service_no_auth: "true"
       RBE_remote_headers: "x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_API_KEY }}"
+
+      # Keep all RBE diagnostics in one place.
       RBE_log_dir: "/tmp/rbe-test"
       RBE_proxy_log_dir: "/tmp/rbe-test"
       RBE_output_dir: "/tmp/rbe-test"
+      RBE_reproxy_wait_seconds: "30"
+      RBE_v: "1"
+
+      # This workflow is a correctness / connectivity test, not a speed test.
       NINJA_REMOTE_NUM_JOBS: "1"
+      NINJA_HIGHMEM_NUM_JOBS: "1"
 
     steps:
       - name: Reclaim root disk
+        shell: bash
         run: |
-          set -eux
+          set -e
           sudo swapoff -a || true
           sudo rm -f /swapfile /build-swap /mnt/swapfile || true
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost || true
           sudo docker image prune -a -f >/dev/null 2>&1 || true
+
           mkdir -p /home/runner/work/los /tmp/rbe-test
+
+          echo "=== DISK ==="
           df -h /
+          echo "=== MEMORY ==="
           free -h
+          echo "=== CPU ==="
           nproc
 
       - name: Checkout local manifest
@@ -44,16 +76,53 @@ jobs:
 
       - name: Install build dependencies
         working-directory: /home/runner/work
+        shell: bash
         run: |
-          set -eux
+          set -e
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y             bc bison build-essential ccache curl flex g++-multilib gcc-multilib             git git-lfs gnupg gperf imagemagick lib32readline-dev lib32z1-dev             libelf-dev liblz4-tool libsdl1.2-dev libssl-dev libxml2             libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc             zip zlib1g-dev python3 python-is-python3 openjdk-21-jdk-headless             ninja-build
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            curl \
+            flex \
+            g++-multilib \
+            gcc-multilib \
+            git \
+            git-lfs \
+            gnupg \
+            gperf \
+            imagemagick \
+            lib32readline-dev \
+            lib32z1-dev \
+            libelf-dev \
+            liblz4-tool \
+            libsdl1.2-dev \
+            libssl-dev \
+            libxml2 \
+            libxml2-utils \
+            lzop \
+            pngcrush \
+            rsync \
+            schedtool \
+            squashfs-tools \
+            xsltproc \
+            zip \
+            zlib1g-dev \
+            python3 \
+            python-is-python3 \
+            openjdk-21-jdk-headless \
+            ninja-build
+
           mkdir -p "$HOME/bin"
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          curl -fsSL \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$HOME/bin/repo"
           chmod a+x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Validate BuildBuddy secret
+        shell: bash
         run: |
           set -e
           if [ -z "${BUILDBUDDY_API_KEY:-}" ]; then
@@ -61,38 +130,49 @@ jobs:
             exit 1
           fi
 
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: /home/runner/work/los/.ccache
-          key: "ccache-los22-star2lte-rbe-${{ github.run_id }}"
-          restore-keys: |
-            ccache-los22-star2lte-rbe-
-            ccache-los22-star2lte-
-          save-always: true
-
-      - name: repo init and local manifest
+      - name: Repo init and install local manifest
         working-directory: /home/runner/work
+        shell: bash
         run: |
-          set -eux
+          set -e
+
           git config --global user.email "ci@local"
           git config --global user.name "ci"
           git config --global color.ui false
+
           mkdir -p /home/runner/work/los
           cd /home/runner/work/los
-          repo init --depth=1 -u https://github.com/LineageOS/android.git -b lineage-22.2
-          mkdir -p .repo/local_manifests
-          cp "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml" ".repo/local_manifests/star2lte.xml"
-          test -s ".repo/local_manifests/star2lte.xml"
-          sed -n '1,220p' .repo/local_manifests/star2lte.xml
 
-      - name: repo sync
+          repo init \
+            --depth=1 \
+            -u https://github.com/LineageOS/android.git \
+            -b lineage-22.2
+
+          mkdir -p .repo/local_manifests
+
+          MANIFEST_SRC="$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml"
+          MANIFEST_DST=".repo/local_manifests/star2lte.xml"
+
+          if [ ! -s "$MANIFEST_SRC" ]; then
+            echo "::error::Local manifest not found or empty: $MANIFEST_SRC"
+            exit 1
+          fi
+
+          cp "$MANIFEST_SRC" "$MANIFEST_DST"
+
+          echo "=== LOCAL MANIFEST ==="
+          sed -n '1,260p' "$MANIFEST_DST"
+
+      - name: Repo sync
         working-directory: /home/runner/work/los
         timeout-minutes: 120
+        shell: bash
         run: |
-          set -e
+          set -eo pipefail
+
           (
             while true; do
+              echo "=== RESOURCE SNAPSHOT ==="
               df -h / | tail -1
               free -h | head -2
               sleep 30
@@ -100,176 +180,260 @@ jobs:
           ) &
           MONPID=$!
           trap 'kill "$MONPID" 2>/dev/null || true' EXIT
-          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j"$(nproc)" ||           repo sync -c --no-clone-bundle --no-tags --prune -j4
+
+          if ! repo sync \
+            -c \
+            --no-clone-bundle \
+            --no-tags \
+            --optimized-fetch \
+            --prune \
+            -j"$(nproc)"; then
+            echo "::warning::Parallel repo sync failed; retrying with -j4."
+            repo sync \
+              -c \
+              --no-clone-bundle \
+              --no-tags \
+              --prune \
+              -j4
+          fi
+
+          echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
 
-      - name: Inspect reclient
+      - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
+        shell: bash
         run: |
-          set -eux
-          ls -lah prebuilts/remoteexecution-client/live
-          test -x prebuilts/remoteexecution-client/live/reproxy
-          test -x prebuilts/remoteexecution-client/live/rewrapper
-          prebuilts/remoteexecution-client/live/reproxy --help >/tmp/rbe-test/reproxy-help.txt 2>&1 || true
-          prebuilts/remoteexecution-client/live/rewrapper --help >/tmp/rbe-test/rewrapper-help.txt 2>&1 || true
-          sed -n '1,120p' /tmp/rbe-test/rewrapper-help.txt
+          set -eo pipefail
 
-      - name: BuildBuddy connectivity
+          echo "=== PRODUCT REGISTRATION ==="
+
+          MATCHES="$(
+            grep -R -l \
+              --include='AndroidProducts.mk' \
+              'lineage_star2lte' \
+              device vendor 2>/dev/null | head -20 || true
+          )"
+
+          if [ -z "$MATCHES" ]; then
+            echo "::error::Could not find lineage_star2lte in any AndroidProducts.mk."
+            echo "The local manifest did not sync/register the star2lte product correctly."
+            find device vendor -maxdepth 4 -name AndroidProducts.mk -print 2>/dev/null | head -100 || true
+            exit 1
+          fi
+
+          printf '%s\n' "$MATCHES"
+
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            echo "--- $file"
+            sed -n '1,180p' "$file"
+          done <<< "$MATCHES"
+
+      - name: Inspect Android reclient
         working-directory: /home/runner/work/los
+        shell: bash
         run: |
-          set -eux
+          set -e
+
+          echo "=== RECLIENT DIRECTORY ==="
+          ls -lah "$RBE_DIR"
+
+          test -x "$RBE_DIR/reproxy"
+          test -x "$RBE_DIR/rewrapper"
+          test -x "$RBE_DIR/bootstrap"
+
+          echo "=== REPROXY VERSION ==="
+          "$RBE_DIR/reproxy" --version || true
+
+          echo "=== REWRAPPER VERSION ==="
+          "$RBE_DIR/rewrapper" --version || true
+
+          echo "=== BOOTSTRAP VERSION ==="
+          "$RBE_DIR/bootstrap" --version || true
+
+      - name: Check BuildBuddy network connectivity
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== DNS ==="
           getent hosts remote.buildbuddy.io
-          curl -fsSIL --max-time 30 https://remote.buildbuddy.io/ | head -20
-          HTTP_CODE="$(curl -sS -o /tmp/rbe-test/buildbuddy-response.txt -w '%{http_code}' --max-time 30 -H "x-buildbuddy-api-key: ${BUILDBUDDY_API_KEY}" https://remote.buildbuddy.io/)"
-          echo "Authenticated HTTPS status: ${HTTP_CODE}"
-          test "${HTTP_CODE}" = "200"
 
-      - name: Configure Lineage build environment for RBE
+          echo "=== TCP 443 ==="
+          timeout 15 bash -c 'cat < /dev/null > /dev/tcp/remote.buildbuddy.io/443'
+
+          echo "BuildBuddy TCP endpoint is reachable."
+          echo "Authentication will be validated by the real reclient compile below."
+
+      - name: Configure Lineage and run real RBE C++ compile
         working-directory: /home/runner/work/los
+        timeout-minutes: 45
+        shell: bash
         run: |
-          set -ex
+          set -eo pipefail
+
+          mkdir -p /tmp/rbe-test
+
+          # Lineage's breakfast helper reads the correct target release from
+          # vendor/lineage/vars/aosp_target_release and expands star2lte to
+          # lineage_star2lte-<release>-userdebug.
           source build/envsetup.sh
-          export USE_RBE=1
-          export RBE_service="$RBE_SERVICE"
-          export RBE_DIR="$RBE_DIR"
-          export RBE_CXX_EXEC_STRATEGY="$RBE_CXX_EXEC_STRATEGY"
-          export RBE_use_application_default_credentials="$RBE_use_application_default_credentials"
-          export RBE_remote_headers="$RBE_remote_headers"
-          export RBE_log_dir="$RBE_log_dir"
-          export RBE_proxy_log_dir="$RBE_proxy_log_dir"
-          export RBE_output_dir="$RBE_output_dir"
-          export NINJA_REMOTE_NUM_JOBS="$NINJA_REMOTE_NUM_JOBS"
+          source vendor/lineage/vars/aosp_target_release
 
+          EXPECTED_RELEASE="${aosp_target_release}"
           breakfast star2lte userdebug
-          lunch star2lte-lineage-22.2-userdebug
 
+          echo "=== LINEAGE BUILD SELECTION ==="
+          echo "ANDROID_BUILD_TOP=${ANDROID_BUILD_TOP:-unset}"
           echo "TARGET_PRODUCT=${TARGET_PRODUCT:-unset}"
           echo "TARGET_RELEASE=${TARGET_RELEASE:-unset}"
           echo "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-unset}"
           echo "TARGET_BUILD_TYPE=${TARGET_BUILD_TYPE:-unset}"
-          echo "TOP=${TOP:-unset}"
+          echo "EXPECTED_RELEASE=${EXPECTED_RELEASE}"
 
-          test "${TARGET_PRODUCT}" = "star2lte"
-          test "${TARGET_RELEASE}" = "lineage-22.2"
+          test -n "${ANDROID_BUILD_TOP:-}"
+          test "${TARGET_PRODUCT}" = "lineage_star2lte"
+          test "${TARGET_RELEASE}" = "${EXPECTED_RELEASE}"
           test "${TARGET_BUILD_VARIANT}" = "userdebug"
-          test -n "${TOP}"
 
-          mkdir -p /tmp/rbe-test
-          env | sort | grep -E '^(USE_RBE|RBE_|NINJA_REMOTE)' |             sed 's/x-buildbuddy-api-key=.*/x-buildbuddy-api-key=<redacted>/'             > /tmp/rbe-test/rbe-env.txt
-
-      - name: Generate Android build graph with RBE enabled
-        working-directory: /home/runner/work/los
-        timeout-minutes: 45
-        run: |
-          set -ex
-          source build/envsetup.sh
-          export USE_RBE=1
-          export RBE_service="$RBE_SERVICE"
-          export RBE_DIR="$RBE_DIR"
-          export RBE_CXX_EXEC_STRATEGY="$RBE_CXX_EXEC_STRATEGY"
-          export RBE_use_application_default_credentials="$RBE_use_application_default_credentials"
-          export RBE_remote_headers="$RBE_remote_headers"
-          export RBE_log_dir="$RBE_log_dir"
-          export RBE_proxy_log_dir="$RBE_proxy_log_dir"
-          export RBE_output_dir="$RBE_output_dir"
-          export NINJA_REMOTE_NUM_JOBS="$NINJA_REMOTE_NUM_JOBS"
-          lunch star2lte-lineage-22.2-userdebug
-
-          echo "TARGET_PRODUCT=${TARGET_PRODUCT}"
-          echo "TARGET_RELEASE=${TARGET_RELEASE}"
-          echo "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT}"
-          echo "TOP=${TOP}"
-
-          mkdir -p /tmp/rbe-test
-          m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
-
-          echo "=== BUILD.NINJA SEARCH ==="
-          find "$TOP/out" -type f -name build.ninja -print | tee /tmp/rbe-test/build-ninja-list.txt
-          test -s /tmp/rbe-test/build-ninja-list.txt
-
-      - name: Find a real C++ compile target
-        working-directory: /home/runner/work/los
-        run: |
-          set -ex
-          source build/envsetup.sh
-          export USE_RBE=1
-          export RBE_service="$RBE_SERVICE"
-          export RBE_DIR="$RBE_DIR"
-          export RBE_CXX_EXEC_STRATEGY="$RBE_CXX_EXEC_STRATEGY"
-          export RBE_use_application_default_credentials="$RBE_use_application_default_credentials"
-          export RBE_remote_headers="$RBE_remote_headers"
-          export RBE_log_dir="$RBE_log_dir"
-          export RBE_proxy_log_dir="$RBE_proxy_log_dir"
-          export RBE_output_dir="$RBE_output_dir"
-          export NINJA_REMOTE_NUM_JOBS="$NINJA_REMOTE_NUM_JOBS"
-          lunch star2lte-lineage-22.2-userdebug
-
-          BUILD_NINJA="$(find "$TOP/out" -type f -name build.ninja | head -1)"
-          test -n "$BUILD_NINJA"
-          echo "Using build graph: $BUILD_NINJA"
-
-          ninja -f "$BUILD_NINJA" -t targets all > /tmp/rbe-test/ninja-targets.txt
-
-          CXX_TARGET="$(
-            awk '
-              /^build / { target=$2; next }
-              /command =/ && ($0 ~ /clang\+\+|clang|g\+\+|c\+\+/) {
-                print target
-                exit
-              }
-            ' "$BUILD_NINJA"
-          )"
-
-          if [ -z "${CXX_TARGET}" ]; then
-            echo "::error::Could not identify a C++ compile edge in ${BUILD_NINJA}."
-            grep -n -m 20 -E 'command =.*(clang\+\+|clang|g\+\+)' "$BUILD_NINJA" || true
+          if [ "$(cd "$ANDROID_BUILD_TOP" && pwd -P)" != "$(pwd -P)" ]; then
+            echo "::error::ANDROID_BUILD_TOP does not point at the current source tree."
             exit 1
           fi
 
-          echo "Selected C++ target: ${CXX_TARGET}"
-          printf '%s\n' "${CXX_TARGET}" > /tmp/rbe-test/cxx-target.txt
+          echo "=== EFFECTIVE RBE CONFIG ==="
+          {
+            echo "USE_RBE=${USE_RBE}"
+            echo "RBE_service=${RBE_service}"
+            echo "RBE_DIR=${RBE_DIR}"
+            echo "RBE_CXX_EXEC_STRATEGY=${RBE_CXX_EXEC_STRATEGY}"
+            echo "RBE_use_application_default_credentials=${RBE_use_application_default_credentials}"
+            echo "RBE_use_rpc_credentials=${RBE_use_rpc_credentials}"
+            echo "RBE_service_no_auth=${RBE_service_no_auth}"
+            echo "RBE_remote_headers=x-buildbuddy-api-key=<redacted>"
+            echo "RBE_log_dir=${RBE_log_dir}"
+            echo "RBE_proxy_log_dir=${RBE_proxy_log_dir}"
+            echo "RBE_output_dir=${RBE_output_dir}"
+            echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
+          } | tee /tmp/rbe-test/rbe-env.txt
 
-      - name: Execute one real C++ compile
-        working-directory: /home/runner/work/los
-        timeout-minutes: 30
-        run: |
-          set -ex
-          source build/envsetup.sh
-          export USE_RBE=1
-          export RBE_service="$RBE_SERVICE"
-          export RBE_DIR="$RBE_DIR"
-          export RBE_CXX_EXEC_STRATEGY="$RBE_CXX_EXEC_STRATEGY"
-          export RBE_use_application_default_credentials="$RBE_use_application_default_credentials"
-          export RBE_remote_headers="$RBE_remote_headers"
-          export RBE_log_dir="$RBE_log_dir"
-          export RBE_proxy_log_dir="$RBE_proxy_log_dir"
-          export RBE_output_dir="$RBE_output_dir"
-          export NINJA_REMOTE_NUM_JOBS="$NINJA_REMOTE_NUM_JOBS"
-          lunch star2lte-lineage-22.2-userdebug
+          echo "=== GENERATE BUILD GRAPH ==="
+          m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
 
-          BUILD_NINJA="$(find "$TOP/out" -type f -name build.ninja | head -1)"
-          test -n "$BUILD_NINJA"
-          TARGET="$(cat /tmp/rbe-test/cxx-target.txt)"
-          echo "Executing real C++ compile target: $TARGET"
-          ninja -f "$BUILD_NINJA" -v -j1 "$TARGET" 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
+          BUILD_NINJA="$ANDROID_BUILD_TOP/out/combined-${TARGET_PRODUCT}.ninja"
+
+          if [ ! -s "$BUILD_NINJA" ]; then
+            echo "::warning::Expected combined ninja was not found at: $BUILD_NINJA"
+            BUILD_NINJA="$(
+              find "$ANDROID_BUILD_TOP/out" \
+                -maxdepth 1 \
+                -type f \
+                -name 'combined*.ninja' \
+                -print | head -1
+            )"
+          fi
+
+          if [ -z "${BUILD_NINJA:-}" ] || [ ! -s "$BUILD_NINJA" ]; then
+            echo "::error::Could not locate the generated combined Ninja graph."
+            find "$ANDROID_BUILD_TOP/out" -maxdepth 2 -type f -name '*.ninja' -print | head -100 || true
+            exit 1
+          fi
+
+          echo "BUILD_NINJA=$BUILD_NINJA" | tee /tmp/rbe-test/build-ninja.txt
+
+          echo "=== VERIFY REWRAPPER IS PRESENT IN GENERATED GRAPH ==="
+          : > /tmp/rbe-test/rewrapper-ninja-matches.txt
+          FOUND_REWRAPPER=0
+
+          for ninja_file in \
+            "$ANDROID_BUILD_TOP/out/soong/build.ninja" \
+            "$BUILD_NINJA"; do
+            if [ -s "$ninja_file" ]; then
+              if grep -n -m 20 -E 'remoteexecution-client/.*/rewrapper|(^|[ /])rewrapper([ "]|$)' \
+                "$ninja_file" \
+                | tee -a /tmp/rbe-test/rewrapper-ninja-matches.txt; then
+                FOUND_REWRAPPER=1
+              fi
+            fi
+          done
+
+          if [ "$FOUND_REWRAPPER" -ne 1 ]; then
+            echo "::error::RBE is enabled, but no rewrapper command was found in the generated Ninja graph."
+            echo "This means the C/C++ actions are not actually being routed through reclient."
+            exit 1
+          fi
+
+          echo "=== REAL C++ BUILD: libbase ==="
+          echo "This is intentionally a clean source-output build without restored ccache."
+          echo "RBE_CXX_EXEC_STRATEGY=remote makes a remote failure fatal instead of silently falling back locally."
+
+          m -j1 libbase 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
+
+          echo "=== RBE OUTPUT FILES ==="
+          find /tmp/rbe-test \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p %s bytes\n' \
+            | sort \
+            | tee /tmp/rbe-test/rbe-files.txt
+
+          echo "=== RBE METRICS ==="
+          if [ -s /tmp/rbe-test/rbe_metrics.txt ]; then
+            cat /tmp/rbe-test/rbe_metrics.txt
+          else
+            echo "::warning::rbe_metrics.txt was not produced by this reclient version."
+          fi
+
+          echo "=== RBE ERROR SCAN ==="
+          grep -R -n -E \
+            'Unauthenticated|PermissionDenied|PERMISSION_DENIED|UNAUTHENTICATED|credential|authentication|FAILED|FATAL|ERROR' \
+            /tmp/rbe-test \
+            --exclude='real-cxx-compile.log' \
+            --exclude='m-nothing.log' \
+            2>/dev/null | head -200 || true
+
+          echo "=== RBE TEST PASSED ==="
+          echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_RELEASE}-${TARGET_BUILD_VARIANT}"
+          echo "Real C++ module build completed with RBE_CXX_EXEC_STRATEGY=remote."
 
       - name: RBE diagnostics
         if: always()
         working-directory: /home/runner/work/los
+        shell: bash
         run: |
           set +e
+
           mkdir -p /tmp/rbe-test
-          echo "=== RBE ENV ==="
+
+          echo "=== SAFE RBE ENV ==="
           cat /tmp/rbe-test/rbe-env.txt 2>/dev/null || true
+
           echo "=== RBE LOG DIRECTORY ==="
-          find /tmp/rbe-test -maxdepth 2 -type f -printf '%p %s bytes\n' | sort || true
+          find /tmp/rbe-test \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p %s bytes\n' \
+            | sort || true
+
           echo "=== REPROXY PROCESSES ==="
-          ps aux | grep -E '[r]eproxy|[r]ewrapper' || true
+          ps aux | grep -E '[r]eproxy|[r]ewrapper|[s]candeps' || true
+
           echo "=== DISK ==="
           df -h / /home/runner/work/los || true
-          echo "=== LAST BUILD LOG LINES ==="
-          tail -n 120 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
-          tail -n 160 /tmp/rbe-test/real-cxx-compile.log 2>/dev/null || true
+
+          echo "=== REPROXY LOG TAIL ==="
+          tail -n 220 /tmp/rbe-test/reproxy_log.txt 2>/dev/null || true
+
+          echo "=== RBE METRICS ==="
+          cat /tmp/rbe-test/rbe_metrics.txt 2>/dev/null || true
+
+          echo "=== BUILD GRAPH LOG TAIL ==="
+          tail -n 160 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
+
+          echo "=== REAL C++ BUILD LOG TAIL ==="
+          tail -n 220 /tmp/rbe-test/real-cxx-compile.log 2>/dev/null || true
 
       - name: Upload RBE test logs
         if: always()
