@@ -246,7 +246,7 @@ jobs:
         working-directory: /home/runner/work/los
         timeout-minutes: 45
         run: |
-          set -eux
+          set -ex
 
           source build/envsetup.sh
 
