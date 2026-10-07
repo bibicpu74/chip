@@ -257,4 +257,38 @@
 <!-- security fuzzers require packages/services/Car watchdog defaults -->
 <remove-project name="platform/tools/security" />
 
+    <!-- ===== tier 6: remove CTS / VTS / test infrastructure =====
+       platform/cts is intentionally absent from this CI tree.
+       A plain star2lte ROM build does not need CTS/VTS/MTS suites.
+       Keeping these projects leaves dangling cts_defaults/tradefed
+       dependencies during Soong graph generation. -->
+
+  <!-- Android test suites -->
+  <remove-project name="platform/test/app_compat/csuite" />
+  <remove-project name="platform/test/catbox" />
+  <remove-project name="platform/test/cts-root" />
+  <remove-project name="platform/test/dittosuite" />
+  <remove-project name="platform/test/mlts/benchmark" />
+  <remove-project name="platform/test/mlts/models" />
+  <remove-project name="platform/test/mts" />
+  <remove-project name="platform/test/robolectric-extensions" />
+  <remove-project name="platform/test/suite_harness" />
+
+  <!-- VTS -->
+  <remove-project name="platform/test/vts" />
+  <remove-project name="platform/test/vts-testcase/hal" />
+  <remove-project name="platform/test/vts-testcase/hal-trace" />
+  <remove-project name="platform/test/vts-testcase/kernel" />
+  <remove-project name="platform/test/vts-testcase/nbu" />
+  <remove-project name="platform/test/vts-testcase/performance" />
+  <remove-project name="platform/test/vts-testcase/security" />
+  <remove-project name="platform/test/vts-testcase/vndk" />
+
+  <!-- Tradefed / host test infrastructure -->
+  <remove-project name="platform/tools/tradefederation" />
+  <remove-project name="platform/tools/tradefederation/contrib" />
+  <remove-project name="platform/tools/tradefederation/prebuilts" />
+  <remove-project name="platform/tools/loganalysis" />
+  <remove-project name="platform/tools/acloud" />
+
 </manifest>
