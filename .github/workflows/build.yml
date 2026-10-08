@@ -404,6 +404,7 @@ jobs:
           // lockedregioncodeinjection_input; those are not selected for the ROM.
           java_library_static {
               name: "platform-test-annotations",
+              host_supported: true,
           }
           EOF
 
