@@ -450,7 +450,11 @@ jobs:
           echo "Fetching minimal platform/development providers from ${DEV_AOSP_TAG}..."
           git clone             --depth=1             --filter=blob:none             --sparse             --branch "$DEV_AOSP_TAG"             https://android.googlesource.com/platform/development             "$DEV_TMP_DIR/development"
 
-          git -C "$DEV_TMP_DIR/development" sparse-checkout set             sdk             scripts             python-packages
+          # Also stage original Windows-only ADB USB libraries. Soong resolves
+          # target.windows shared_libs while generating the global graph, even
+          # though the runner builds only Linux/Android targets.
+          git -C "$DEV_TMP_DIR/development" sparse-checkout set \
+            sdk scripts python-packages host/windows
 
           cp             "$DEV_TMP_DIR/development/sdk/plat_tools_source.prop_template"             "$DEV_STAGE_DIR/sdk/"
 
@@ -458,6 +462,11 @@ jobs:
 
           mkdir -p "$DEV_STAGE_DIR/python-packages/adb"
           cp -a             "$DEV_TMP_DIR/development/python-packages/adb/."             "$DEV_STAGE_DIR/python-packages/adb/"
+
+          # Copy upstream Android.bp + real Windows DLL/import library + headers.
+          # No fake cc_* library and no duplicate name in ci-diet/Android.bp.
+          mkdir -p "$DEV_STAGE_DIR/host"
+          cp -a "$DEV_TMP_DIR/development/host/windows" "$DEV_STAGE_DIR/host/"
 
           rm -rf "$DEV_TMP_DIR"
 
@@ -474,6 +483,29 @@ jobs:
             exit 1
           fi
 
+          WIN_ADB_DIR="$DEV_STAGE_DIR/host/windows"
+          WIN_ADB_BP="$WIN_ADB_DIR/Android.bp"
+          # These files must be real prebuilt assets from the selected AOSP tag.
+          for required_file in \
+            "$WIN_ADB_BP" \
+            "$WIN_ADB_DIR/prebuilt/usb/AdbWinApi.dll" \
+            "$WIN_ADB_DIR/prebuilt/usb/AdbWinApi.lib" \
+            "$WIN_ADB_DIR/prebuilt/usb/AdbWinUsbApi.dll" \
+            "$WIN_ADB_DIR/usb/api/adb_api.h"
+          do
+            if [ ! -f "$required_file" ]; then
+              echo "::error::Missing original Windows ADB provider file: $required_file"
+              exit 1
+            fi
+          done
+
+          for win_module in AdbWinApi AdbWinUsbApi; do
+            if ! grep -Eq "name:[[:space:]]*\"${win_module}\"" "$WIN_ADB_BP"; then
+              echo "::error::Upstream Windows ADB provider missing: ${win_module}"
+              exit 1
+            fi
+          done
+          echo "Original Windows ADB providers staged: $WIN_ADB_BP"
           echo "Minimal development providers staged successfully."
 
           # libflagtest is a REAL C++ test helper from platform_testing.
@@ -767,6 +799,24 @@ jobs:
             exit 1
           fi
           echo "Using upstream adb_py provider: $ADB_BP"
+
+          # Windows-only shared modules must come from the staged upstream BP.
+          WIN_ADB_BP="ci-diet/development-provider/host/windows/Android.bp"
+          if [ ! -f "$WIN_ADB_BP" ]; then
+            echo "::error::Missing original Windows ADB Android.bp"
+            exit 1
+          fi
+          for module in AdbWinApi AdbWinUsbApi; do
+            if ! grep -Eq "name:[[:space:]]*\"${module}\"" "$WIN_ADB_BP"; then
+              echo "::error::Missing upstream Windows ADB Soong module: $module"
+              exit 1
+            fi
+            if grep -Eq "name:[[:space:]]*\"${module}\"" ci-diet/Android.bp; then
+              echo "::error::Duplicate Windows ADB module in ci-diet/Android.bp: $module"
+              exit 1
+            fi
+          done
+          echo "Using upstream Windows-only ADB providers: $WIN_ADB_BP"
 
           for module in \
             cts_error_prone_rules \
@@ -1081,6 +1131,9 @@ jobs:
           grep -n 'name: "platform_tools_version"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
           grep -n 'name: "python-symbol"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
           grep -n 'name: "adb_py"' "$ANDROID_BUILD_TOP/ci-diet/development-provider/python-packages/adb/Android.bp"
+          test -f "$ANDROID_BUILD_TOP/ci-diet/development-provider/host/windows/prebuilt/usb/AdbWinApi.dll"
+          grep -n -E 'name:[[:space:]]*"(AdbWinApi|AdbWinUsbApi)"' \
+            "$ANDROID_BUILD_TOP/ci-diet/development-provider/host/windows/Android.bp"
           test -f "$ANDROID_BUILD_TOP/external/eigen/Android.bp"
           grep -n 'name: "libeigen"' "$ANDROID_BUILD_TOP/external/eigen/Android.bp" | head -1
 
