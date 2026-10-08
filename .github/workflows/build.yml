@@ -206,6 +206,14 @@ jobs:
             rm -rf tools/asuite
           fi
 
+          # development/ only contains SDK packaging, samples and developer tooling
+          # for this build. Its build-tools target depends on the intentionally
+          # removed prebuilts/module_sdk/art tree.
+          if [ -d development ]; then
+            echo "::warning::development tree is present; removing it from the ephemeral CI tree."
+            rm -rf development
+          fi
+
           echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
 
@@ -348,6 +356,11 @@ jobs:
           java_library_host {
               name: "awssdk-url-connection-client",
           }
+
+          // ===== Removed suite_harness host library =====
+          java_library_host {
+              name: "compatibility-tradefed",
+          }
           EOF
 
           echo "=== CI DIET SOONG STUBS ==="
@@ -374,7 +387,8 @@ jobs:
             cts-install-lib-host \
             loganalysis \
             awssdk-kms \
-            awssdk-url-connection-client
+            awssdk-url-connection-client \
+            compatibility-tradefed
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
               echo "::error::Missing CI diet Soong stub: ${module}"
@@ -391,6 +405,11 @@ jobs:
 
           if [ -d tools/asuite ]; then
             echo "::error::tools/asuite is still present in the CI diet tree."
+            exit 1
+          fi
+
+          if [ -d development ]; then
+            echo "::error::development is still present in the CI diet tree."
             exit 1
           fi
 
