@@ -293,6 +293,7 @@
   <remove-project name="platform/tools/loganalysis" />
   <remove-project name="platform/tools/acloud" />
   <remove-project name="platform/tools/asuite" />
+  <remove-project name="LineageOS/android_development" />
 
   <!-- ===== tier 7: CI-only CTS / MTS compatibility defaults =====
        platform/cts intentionally remains removed to keep the GitHub runner tree
@@ -353,5 +354,18 @@
 
        The AWS shims only satisfy optional apksig KMS modules; normal ROM APK
        signing continues to use the regular apksig/apksigner path. -->
+
+  <!-- ===== tier 10: development SDK/tooling tree =====
+       LineageOS/android_development is not needed for a normal star2lte ROM.
+       Its development/build Android.bp packages Android SDK Build Tools and
+       depends on prebuilt_core-lambda-stubs from prebuilts/module_sdk/art,
+       which is intentionally removed by tier 3.
+
+       Removing the development tree is preferable to restoring the ART module
+       SDK prebuilt solely for SDK packaging that this CI job never builds.
+
+       compatibility-tradefed remains referenced by host-test modules living
+       inside ART/deqp, so the workflow supplies one tiny java_library_host
+       graph-resolution shim for it. -->
 
 </manifest>
