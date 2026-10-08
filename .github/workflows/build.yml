@@ -160,6 +160,52 @@ jobs:
 
           cp "$MANIFEST_SRC" "$MANIFEST_DST"
 
+          # v19: Restore two real C/C++ providers from the LineageOS 22.2
+          # default manifest. The original star2lte.xml in Git remains intact.
+          #
+          # - platform/external/bcc supplies libbpf_bcc used by libtimeinstate
+          #   and libmemevents (runtime/system libraries; must not be stubbed).
+          # - platform/hardware/google/apf supplies the APF libraries referenced
+          #   by NetworkStack JNI tests. Restoring this small project avoids
+          #   breaking the NetworkStack test graph with partial tree pruning.
+          #
+          # Both default-manifest projects use the pinned AOSP remote revision
+          # refs/tags/android-15.0.0_r32. Let repo sync select their revisions;
+          # do not fetch main or invent a replacement cc_library.
+          python3 <<'PY_RESTORE_RUNTIME'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          p = Path(".repo/local_manifests/star2lte.xml")
+          original = p.read_text(encoding="utf-8")
+          source = original
+          required = (
+              "platform/external/bcc",
+              "platform/hardware/google/apf",
+          )
+          root = ET.fromstring(source)
+          to_remove = [element.get("name") for element in root.findall("remove-project")]
+          for project in required:
+              if project not in to_remove:
+                  print(f"Already not removed: {project}")
+                  continue
+              line = f'<remove-project name="{project}" />'
+              if source.count(line) != 1:
+                  raise SystemExit(f"Unexpected local-manifest syntax for: {project}")
+              source = source.replace(
+                  line,
+                  f'<!-- KEEP: {project} provides real Soong C/C++ libraries needed for v19. -->',
+                  1,
+              )
+              print(f"Restored default-manifest project: {project}")
+
+          ET.fromstring(source)
+          p.write_text(source, encoding="utf-8")
+          if any(item.get("name") in required
+                 for item in ET.parse(p).getroot().findall("remove-project")):
+              raise SystemExit("BCC/APF still removed in CI manifest")
+          PY_RESTORE_RUNTIME
+
           echo "=== LOCAL MANIFEST ==="
           sed -n '1,260p' "$MANIFEST_DST"
 
@@ -359,6 +405,35 @@ jobs:
             echo "::error::Missing Secretkeeper AIDL definition after pruning."
             exit 1
           }
+
+          # v19: Verify both real providers returned by repo sync. These checks
+          # run before Soong so missing projects are not misdiagnosed as RBE
+          # failures or fixed with unsafe empty C/C++ stubs.
+          if [ ! -f external/bcc/Android.bp ]; then
+            echo "::error::external/bcc/Android.bp was not synced."
+            exit 1
+          fi
+          if ! grep -Eq 'name:[[:space:]]*"libbpf_bcc"' external/bcc/Android.bp; then
+            echo "::error::Restored external/bcc does not define libbpf_bcc."
+            exit 1
+          fi
+
+          if [ ! -f hardware/google/apf/Android.bp ]; then
+            echo "::error::hardware/google/apf/Android.bp was not synced."
+            exit 1
+          fi
+          for module in libapf libapf_v7 libapfdisassembler; do
+            if ! grep -R -l -F --include='Android.bp' -- \
+              "name: \"${module}\"" hardware/google/apf >/dev/null; then
+              echo "::error::Restored hardware/google/apf is missing: $module"
+              exit 1
+            fi
+          done
+
+          echo "=== RESTORED BCC/APF PROVIDERS ==="
+          grep -n 'name: "libbpf_bcc"' external/bcc/Android.bp
+          find hardware/google/apf -name Android.bp -print
+          df -h /
 
           # Eigen is a real dependency of TensorFlow Lite and NeuralNetworks.
           # It must be present from the local manifest; do not replace it with a
