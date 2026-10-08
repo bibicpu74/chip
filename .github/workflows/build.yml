@@ -214,6 +214,22 @@ jobs:
             rm -rf development
           fi
 
+          # crosvm is part of the virtual-device/AVF stack. With Virtualization
+          # and hardware/google/gfxstream removed, rutabaga_gfx otherwise keeps
+          # a dangling libgfxstream_backend dependency.
+          if [ -d external/crosvm ]; then
+            echo "::warning::external/crosvm is present; removing virtual-device VMM tree."
+            rm -rf external/crosvm
+          fi
+
+          # Keep system/authgraph runtime source, but remove its tests. The test
+          # module depends on libdiced_open_dice from a provider chain that is
+          # intentionally absent from this disk-diet CI tree.
+          if [ -d system/authgraph/tests ]; then
+            echo "::warning::Removing system/authgraph/tests from CI diet tree."
+            rm -rf system/authgraph/tests
+          fi
+
           echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
 
@@ -375,6 +391,20 @@ jobs:
           java_library_host {
               name: "vogarexpectlib",
           }
+
+          // ===== Remaining CTS / platform_testing graph providers =====
+
+          // Upstream platform/cts/tools/cts-tradefed.
+          java_library_host {
+              name: "cts-tradefed-harness",
+          }
+
+          // Upstream platform_testing/libraries/annotations.
+          // This dependency is currently reached by test/input modules such as
+          // lockedregioncodeinjection_input; those are not selected for the ROM.
+          java_library_static {
+              name: "platform-test-annotations",
+          }
           EOF
 
           echo "=== CI DIET SOONG STUBS ==="
@@ -404,7 +434,9 @@ jobs:
             awssdk-url-connection-client \
             compatibility-tradefed \
             json \
-            vogarexpectlib
+            vogarexpectlib \
+            cts-tradefed-harness \
+            platform-test-annotations
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
               echo "::error::Missing CI diet Soong stub: ${module}"
@@ -426,6 +458,16 @@ jobs:
 
           if [ -d development ]; then
             echo "::error::development is still present in the CI diet tree."
+            exit 1
+          fi
+
+          if [ -d external/crosvm ]; then
+            echo "::error::external/crosvm is still present in the CI diet tree."
+            exit 1
+          fi
+
+          if [ -d system/authgraph/tests ]; then
+            echo "::error::system/authgraph/tests is still present in the CI diet tree."
             exit 1
           fi
 
