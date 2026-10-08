@@ -361,6 +361,20 @@ jobs:
           java_library_host {
               name: "compatibility-tradefed",
           }
+
+          // ===== CTS json / vogar host providers removed with platform/cts =====
+          // libcore/tools/non-cts-json-generator is host-side non-CTS tooling.
+          // Match the upstream provider module kinds so Soong can resolve graph.
+
+          java_library {
+              name: "json",
+              host_supported: true,
+              sdk_version: "current",
+          }
+
+          java_library_host {
+              name: "vogarexpectlib",
+          }
           EOF
 
           echo "=== CI DIET SOONG STUBS ==="
@@ -388,7 +402,9 @@ jobs:
             loganalysis \
             awssdk-kms \
             awssdk-url-connection-client \
-            compatibility-tradefed
+            compatibility-tradefed \
+            json \
+            vogarexpectlib
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
               echo "::error::Missing CI diet Soong stub: ${module}"
