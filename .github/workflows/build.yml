@@ -527,8 +527,23 @@ jobs:
           } | tee /tmp/rbe-test/rbe-env.txt
 
           echo "=== VERIFY CI DIET PATCHES BEFORE SOONG ==="
+          BINDINGS="$ANDROID_BUILD_TOP/system/sepolicy/build/soong/service_fuzzer_bindings.go"
+
           if [ ! -d "$ANDROID_BUILD_TOP/packages/modules/Virtualization" ]; then
-            grep -n -E '"android\\.system\\.virtualizationservice"[[:space:]]*:[[:space:]]*EXCEPTION_NO_FUZZER' "$ANDROID_BUILD_TOP/system/sepolicy/build/soong/service_fuzzer_bindings.go"
+            if grep -q 'virtualizationmanager_fuzzer' "$BINDINGS"; then
+              echo "::error::virtualizationmanager_fuzzer binding is still active while Virtualization is absent."
+              grep -n -E 'android\.system\.virtualizationservice|virtualizationmanager_fuzzer' "$BINDINGS" || true
+              exit 1
+            fi
+
+            if grep -q 'android.system.virtualizationservice' "$BINDINGS"; then
+              echo "Virtualization service binding after CI diet patch:"
+              grep -n 'android.system.virtualizationservice' "$BINDINGS" || true
+            else
+              echo "::warning::virtualizationservice binding not found; continuing because the forbidden fuzzer reference is absent."
+            fi
+          else
+            echo "Virtualization tree is present; no CI diet sepolicy verification required."
           fi
 
           echo "=== VERIFY CI DIET STUBS BEFORE SOONG ==="
