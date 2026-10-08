@@ -292,6 +292,7 @@
   <remove-project name="platform/tools/tradefederation/prebuilts" />
   <remove-project name="platform/tools/loganalysis" />
   <remove-project name="platform/tools/acloud" />
+  <remove-project name="platform/tools/asuite" />
 
   <!-- ===== tier 7: CI-only CTS / MTS compatibility defaults =====
        platform/cts intentionally remains removed to keep the GitHub runner tree
@@ -333,5 +334,24 @@
        These are graph-resolution shims only. They do NOT restore Car,
        Virtualization, VTS, Tradefed, or platform_testing and are not intended
        to make those removed test/virtualization products buildable. -->
+
+  <!-- ===== tier 9: host test/tooling consumers =====
+       tools/asuite/atest is not needed for a normal star2lte ROM build and
+       depends on Tradefed, loganalysis and suite_harness host libraries that
+       are intentionally removed from this disk-diet tree.
+
+       Some host-test stanzas that live inside runtime repositories still name
+       those removed host libraries. The workflow provides tiny java_library_host
+       graph-resolution shims for:
+         - tradefed
+         - compatibility-host-util
+         - cts-tradefed
+         - cts-install-lib-host
+         - loganalysis
+         - awssdk-kms
+         - awssdk-url-connection-client
+
+       The AWS shims only satisfy optional apksig KMS modules; normal ROM APK
+       signing continues to use the regular apksig/apksigner path. -->
 
 </manifest>
