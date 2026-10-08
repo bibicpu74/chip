@@ -344,9 +344,11 @@ jobs:
           set -euo pipefail
 
           # packages/modules/Virtualization is intentionally removed from this
-          # disk-diet source tree. system/sepolicy still expects
+          # disk-diet source tree. system/sepolicy still references
           # virtualizationmanager_fuzzer for android.system.virtualizationservice.
-          # Patch only when Virtualization is absent.
+          #
+          # The Go map aligns values using variable whitespace, so use a
+          # whitespace-tolerant regex instead of an exact formatted line.
           if [ -d packages/modules/Virtualization ]; then
             echo "Virtualization tree is present; keeping upstream fuzzer binding."
             exit 0
@@ -359,34 +361,52 @@ jobs:
             exit 1
           fi
 
+          echo "=== BEFORE PATCH ==="
+          grep -n -E 'android\.system\.virtualizationservice|virtualizationmanager_fuzzer' "$BINDINGS" || true
+
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           p = Path("system/sepolicy/build/soong/service_fuzzer_bindings.go")
           s = p.read_text(encoding="utf-8")
 
-          old = '"android.system.virtualizationservice": []string{"virtualizationmanager_fuzzer"},'
-          new = '"android.system.virtualizationservice": EXCEPTION_NO_FUZZER,'
+          already = re.search(
+              r'(?m)^\s*"android\.system\.virtualizationservice"\s*:\s*EXCEPTION_NO_FUZZER\s*,\s*$',
+              s,
+          )
+          if already:
+              print("virtualizationservice is already EXCEPTION_NO_FUZZER.")
+              raise SystemExit(0)
 
-          if new in s:
-              print("CI diet virtualization fuzzer binding is already patched.")
-          elif old in s:
-              p.write_text(s.replace(old, new, 1), encoding="utf-8")
-              print("Patched virtualizationservice fuzzer binding for CI diet.")
-          else:
-              raise SystemExit(
-                  "Expected virtualizationservice fuzzer binding was not found; "
-                  "upstream source may have changed."
-              )
+          pattern = re.compile(
+              r'(?m)^(\s*"android\.system\.virtualizationservice"\s*:\s*)'
+              r'\[\]string\s*\{\s*"virtualizationmanager_fuzzer"\s*\}\s*,\s*$'
+          )
+
+          patched, count = pattern.subn(r'\1EXCEPTION_NO_FUZZER,', s, count=1)
+
+          if count != 1:
+              print("Could not match the virtualizationservice fuzzer binding.")
+              print("Relevant source lines:")
+              for i, line in enumerate(s.splitlines(), 1):
+                  if "android.system.virtualizationservice" in line or "virtualizationmanager_fuzzer" in line:
+                      print(f"{i}: {line}")
+              raise SystemExit(1)
+
+          p.write_text(patched, encoding="utf-8")
+          print("Patched virtualizationservice fuzzer binding for CI diet.")
           PY
 
-          echo "=== VIRTUALIZATION FUZZER BINDING ==="
-          grep -n -A1 -B1 'android.system.virtualizationservice' "$BINDINGS"
+          echo "=== AFTER PATCH ==="
+          grep -n -E 'android\.system\.virtualizationservice|virtualizationmanager_fuzzer' "$BINDINGS" || true
 
-          grep -q             '"android.system.virtualizationservice": EXCEPTION_NO_FUZZER'             "$BINDINGS"
+          if ! grep -Eq '"android\.system\.virtualizationservice"[[:space:]]*:[[:space:]]*EXCEPTION_NO_FUZZER' "$BINDINGS"; then
+            echo "::error::CI diet virtualization fuzzer patch verification failed."
+            exit 1
+          fi
 
           echo "Virtualization fuzzer binding patch verified."
-
       - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
         shell: bash
@@ -508,7 +528,7 @@ jobs:
 
           echo "=== VERIFY CI DIET PATCHES BEFORE SOONG ==="
           if [ ! -d "$ANDROID_BUILD_TOP/packages/modules/Virtualization" ]; then
-            grep -n               '"android.system.virtualizationservice": EXCEPTION_NO_FUZZER'               "$ANDROID_BUILD_TOP/system/sepolicy/build/soong/service_fuzzer_bindings.go"
+            grep -n -E '"android\\.system\\.virtualizationservice"[[:space:]]*:[[:space:]]*EXCEPTION_NO_FUZZER' "$ANDROID_BUILD_TOP/system/sepolicy/build/soong/service_fuzzer_bindings.go"
           fi
 
           echo "=== VERIFY CI DIET STUBS BEFORE SOONG ==="
