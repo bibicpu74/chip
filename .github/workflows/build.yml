@@ -237,11 +237,14 @@ jobs:
             rm -rf packages/apps/DeviceDiagnostics/TradeInModeTests
           fi
 
-          # Mesa's gfxstream guest platform is for virtual GPU guests and pulls
-          # virtgpu_kumquat_* from crosvm. Physical star2lte does not use it.
-          if [ -d external/mesa3d/src/gfxstream ]; then
-            echo "::warning::Pruning Mesa gfxstream guest subtree."
-            rm -rf external/mesa3d/src/gfxstream
+          # Mesa is not used by the physical Exynos/Mali star2lte target.
+          # v14 cut only Mesa's gfxstream subtree and left Vulkan WSI consumers
+          # referencing mesa_gfxstream_vulkan_entrypoints. Do not split a
+          # self-contained source tree: prune the entire virtual/swrast Mesa
+          # project in this CI diet (never create a fake Vulkan runtime module).
+          if [ -d external/mesa3d ]; then
+            echo "::warning::Pruning unused Mesa3D tree (including Vulkan WSI)."
+            rm -rf external/mesa3d
           fi
 
           # The complete hardware/interfaces/automotive subtree is irrelevant
@@ -249,6 +252,71 @@ jobs:
           if [ -d hardware/interfaces/automotive ]; then
             echo "::warning::Pruning hardware/interfaces/automotive."
             rm -rf hardware/interfaces/automotive
+          fi
+
+          # hardware/lineage/compat is used by more than Automotive; keep it.
+          # Strip ONLY the legacy Automotive *-ndk_platform compatibility
+          # libraries. Their AIDL providers were intentionally removed with
+          # hardware/interfaces/automotive for physical star2lte builds.
+          COMPAT_BP="hardware/lineage/compat/Android.bp"
+          if [ ! -f "$COMPAT_BP" ]; then
+            echo "::error::Missing Lineage compatibility file: $COMPAT_BP"
+            exit 1
+          fi
+          python3 <<'PY_COMPAT'
+          from pathlib import Path
+          import re
+
+          p = Path("hardware/lineage/compat/Android.bp")
+          text = p.read_text(encoding="utf-8")
+          starts = list(re.finditer(r"(?m)^[ \t]*cc_library(?:_shared)?[ \t]*\{", text))
+          remove = []
+          for m in starts:
+              depth = 1
+              i = m.end()
+              quote = False
+              escaped = False
+              while i < len(text) and depth > 0:
+                  c = text[i]
+                  if quote:
+                      if escaped:
+                          escaped = False
+                      elif c == "\\":
+                          escaped = True
+                      elif c == '"':
+                          quote = False
+                  elif c == '"':
+                      quote = True
+                  elif c == "{":
+                      depth += 1
+                  elif c == "}":
+                      depth -= 1
+                  i += 1
+              if depth != 0:
+                  raise SystemExit("Unbalanced Soong module in hardware/lineage/compat/Android.bp")
+              block = text[m.start():i]
+              match = re.search(
+                  r'(?m)^[ \t]*name:[ \t]*"(android\.hardware\.automotive\.[^"\n]+-ndk_platform)"',
+                  block,
+              )
+              if match:
+                  remove.append((m.start(), i, match.group(1)))
+
+          if not remove:
+              if 'android.hardware.automotive.occupant_awareness-V1-ndk_platform' in text:
+                  raise SystemExit("Automotive compatibility module found but cannot safely parse its declaration")
+              print("No Automotive NDK-platform compatibility modules remain; skipping.")
+          else:
+              for a, b, name in reversed(remove):
+                  text = text[:a] + text[b:]
+                  print("CI diet pruned compatibility module:", name)
+              p.write_text(text, encoding="utf-8")
+          PY_COMPAT
+
+          # Fail if an Automotive *-ndk_platform library remains as a module.
+          if grep -Eq 'name:[[:space:]]*"android\.hardware\.automotive\.[^"]+-ndk_platform"' "$COMPAT_BP"; then
+            echo "::error::Automotive legacy compat modules still remain."
+            exit 1
           fi
 
           # These two build/make utilities are telemetry/editor monitoring tools.
@@ -407,6 +475,32 @@ jobs:
           fi
 
           echo "Minimal development providers staged successfully."
+
+          # libflagtest is a REAL C++ test helper from platform_testing.
+          # Bluetooth's many cc_test modules refer to it even when the ROM
+          # doesn't build those tests; restore only its source and headers.
+          # Copy files explicitly: do not copy upstream Android.bp or register
+          # any extra test modules that might create further dangling edges.
+          FLAGTEST_TAG="android-15.0.0_r32"
+          FLAGTEST_TMP="$(mktemp -d)"
+          FLAGTEST_SRC="ci-diet/flagtest"
+          trap 'rm -rf "$FLAGTEST_TMP"' EXIT
+          git clone --depth=1 --filter=blob:none --sparse \
+            --branch "$FLAGTEST_TAG" \
+            https://android.googlesource.com/platform/platform_testing \
+            "$FLAGTEST_TMP/platform_testing"
+          git -C "$FLAGTEST_TMP/platform_testing" sparse-checkout set \
+            libraries/flag-helpers/libflagtest
+          SRC_FLAGTEST="$FLAGTEST_TMP/platform_testing/libraries/flag-helpers/libflagtest"
+          test -f "$SRC_FLAGTEST/flag_checker.cpp"
+          test -f "$SRC_FLAGTEST/include/flag_checker.h"
+          test -f "$SRC_FLAGTEST/include/flag_macros.h"
+          mkdir -p "$FLAGTEST_SRC"
+          cp "$SRC_FLAGTEST/flag_checker.cpp" "$FLAGTEST_SRC/"
+          cp -a "$SRC_FLAGTEST/include" "$FLAGTEST_SRC/"
+          rm -rf "$FLAGTEST_TMP"
+          trap - EXIT
+          echo "Real libflagtest source staged from ${FLAGTEST_TAG}."
 
           cat > ci-diet/Android.bp <<'EOF'
           // CI-only compatibility stubs for the disk-diet star2lte source tree.
@@ -626,6 +720,22 @@ jobs:
           // development-provider/python-packages/adb/Android.bp already
           // declares it. Keep that original module to avoid duplicate names.
 
+          // ===== Real libflagtest from platform_testing (test-only) =====
+          // Bluetooth and framework cc_test modules need both its symbols and
+          // the public flag_macros.h header. These are genuine upstream sources,
+          // not an empty test shim.
+          cc_library_static {
+              name: "libflagtest",
+              srcs: ["flagtest/flag_checker.cpp"],
+              export_include_dirs: ["flagtest/include"],
+              host_supported: true,
+              vendor_available: true,
+              product_available: true,
+              native_bridge_supported: true,
+              static_libs: ["libgtest"],
+              shared_libs: ["libbase"],
+          }
+
           // ===== AuthGraph test helper removed with system/authgraph/tests =====
           //
           // This is test-only. The real AuthGraph runtime libraries remain in
@@ -691,6 +801,7 @@ jobs:
             compatibility-host-util-axt \
             platform_tools_version \
             python-symbol \
+            libflagtest \
             libauthgraph_core_test
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
@@ -726,7 +837,7 @@ jobs:
             exit 1
           fi
 
-          for removed_path in             packages/apps/DeviceDiagnostics/TradeInModeTests             external/mesa3d/src/gfxstream             hardware/interfaces/automotive             build/make/tools/edit_monitor             build/make/tools/tool_event_logger
+          for removed_path in             packages/apps/DeviceDiagnostics/TradeInModeTests             external/mesa3d             hardware/interfaces/automotive             build/make/tools/edit_monitor             build/make/tools/tool_event_logger
           do
             if [ -e "$removed_path" ]; then
               echo "::error::CI diet path still exists: $removed_path"
@@ -736,6 +847,12 @@ jobs:
 
           if ! grep -q 'srcs: \["cts-json/src/\*\*/\*.java"\]' ci-diet/Android.bp; then
             echo "::error::json provider is not backed by staged local org.json sources."
+            exit 1
+          fi
+
+          if [ ! -f ci-diet/flagtest/flag_checker.cpp ] || \
+             [ ! -f ci-diet/flagtest/include/flag_macros.h ]; then
+            echo "::error::Real libflagtest sources missing before Soong."
             exit 1
           fi
 
