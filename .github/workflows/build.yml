@@ -336,6 +336,57 @@ jobs:
 
           echo "CI diet Soong compatibility stubs installed successfully."
 
+
+      - name: Patch CI diet virtualization fuzzer binding
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # packages/modules/Virtualization is intentionally removed from this
+          # disk-diet source tree. system/sepolicy still expects
+          # virtualizationmanager_fuzzer for android.system.virtualizationservice.
+          # Patch only when Virtualization is absent.
+          if [ -d packages/modules/Virtualization ]; then
+            echo "Virtualization tree is present; keeping upstream fuzzer binding."
+            exit 0
+          fi
+
+          BINDINGS="system/sepolicy/build/soong/service_fuzzer_bindings.go"
+
+          if [ ! -f "$BINDINGS" ]; then
+            echo "::error::Missing expected sepolicy binding file: $BINDINGS"
+            exit 1
+          fi
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("system/sepolicy/build/soong/service_fuzzer_bindings.go")
+          s = p.read_text(encoding="utf-8")
+
+          old = '"android.system.virtualizationservice": []string{"virtualizationmanager_fuzzer"},'
+          new = '"android.system.virtualizationservice": EXCEPTION_NO_FUZZER,'
+
+          if new in s:
+              print("CI diet virtualization fuzzer binding is already patched.")
+          elif old in s:
+              p.write_text(s.replace(old, new, 1), encoding="utf-8")
+              print("Patched virtualizationservice fuzzer binding for CI diet.")
+          else:
+              raise SystemExit(
+                  "Expected virtualizationservice fuzzer binding was not found; "
+                  "upstream source may have changed."
+              )
+          PY
+
+          echo "=== VIRTUALIZATION FUZZER BINDING ==="
+          grep -n -A1 -B1 'android.system.virtualizationservice' "$BINDINGS"
+
+          grep -q             '"android.system.virtualizationservice": EXCEPTION_NO_FUZZER'             "$BINDINGS"
+
+          echo "Virtualization fuzzer binding patch verified."
+
       - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
         shell: bash
@@ -454,6 +505,11 @@ jobs:
             echo "RBE_output_dir=${RBE_output_dir}"
             echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
           } | tee /tmp/rbe-test/rbe-env.txt
+
+          echo "=== VERIFY CI DIET PATCHES BEFORE SOONG ==="
+          if [ ! -d "$ANDROID_BUILD_TOP/packages/modules/Virtualization" ]; then
+            grep -n               '"android.system.virtualizationservice": EXCEPTION_NO_FUZZER'               "$ANDROID_BUILD_TOP/system/sepolicy/build/soong/service_fuzzer_bindings.go"
+          fi
 
           echo "=== VERIFY CI DIET STUBS BEFORE SOONG ==="
           test -s "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
