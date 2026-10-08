@@ -251,23 +251,33 @@ jobs:
 
           # ProtoLogTool is a real framework build tool and needs actual org.json
           # classes at compile/runtime. Do NOT satisfy json/jsonlib with empty
-          # graph shims. Pull only the tiny CTS libs/json subtree from the exact
-          # AOSP tag matching BUILD_ID=BP1A.250505.005.
-          CTS_JSON_TAG="android-15.0.0_r32"
+          # graph shims.
+          #
+          # The synced libcore tree already contains the Android org.json
+          # implementation for this exact LineageOS revision. Stage those local
+          # sources instead of downloading a CTS archive from Gitiles.
           CTS_JSON_DIR="ci-diet/cts-json"
+          LIBCORE_JSON_DIR="libcore/json/src/main/java/org/json"
 
           rm -rf "$CTS_JSON_DIR"
-          mkdir -p "$CTS_JSON_DIR"
+          mkdir -p "$CTS_JSON_DIR/src/org"
 
-          echo "Fetching minimal CTS JSON sources from ${CTS_JSON_TAG}..."
-          curl -fsSL --retry 3 --retry-delay 2             "https://android.googlesource.com/platform/cts/+archive/refs/tags/${CTS_JSON_TAG}/libs/json.tar.gz"             | tar -xz -C "$CTS_JSON_DIR"
-
-          if [ ! -f "$CTS_JSON_DIR/src/org/json/JSONObject.java" ]; then
-            echo "::error::Failed to fetch real CTS json sources."
+          if [ ! -f "$LIBCORE_JSON_DIR/JSONObject.java" ]; then
+            echo "::error::Missing local libcore org.json sources: $LIBCORE_JSON_DIR"
+            find libcore/json -maxdepth 6 -type f 2>/dev/null | head -100 || true
             exit 1
           fi
 
-          echo "CTS JSON source count: $(find "$CTS_JSON_DIR/src" -type f -name '*.java' | wc -l)"
+          cp -a "$LIBCORE_JSON_DIR" "$CTS_JSON_DIR/src/org/"
+
+          if [ ! -f "$CTS_JSON_DIR/src/org/json/JSONObject.java" ]; then
+            echo "::error::Failed to stage local org.json sources."
+            exit 1
+          fi
+
+          echo "Using org.json sources from current libcore revision."
+          echo "JSON source count: $(find "$CTS_JSON_DIR/src/org/json" -type f -name '*.java' | wc -l)"
+          find "$CTS_JSON_DIR/src/org/json" -maxdepth 1 -type f -name '*.java' -printf '%f\n' | sort
 
           cat > ci-diet/Android.bp <<'EOF'
           // CI-only compatibility stubs for the disk-diet star2lte source tree.
@@ -538,7 +548,7 @@ jobs:
           fi
 
           if ! grep -q 'srcs: \["cts-json/src/\*\*/\*.java"\]' ci-diet/Android.bp; then
-            echo "::error::json provider is not backed by real CTS sources."
+            echo "::error::json provider is not backed by staged local org.json sources."
             exit 1
           fi
 
