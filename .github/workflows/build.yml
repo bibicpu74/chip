@@ -331,6 +331,35 @@ jobs:
             rm -rf build/make/tools/tool_event_logger
           fi
 
+          # ===== CI diet: MTS / Secretkeeper VTS-only consumers =====
+          #
+          # The optional libnativehelper MTS JNI test depends on
+          # libnativetesthelper_jni, which is not present in the dieted tree.
+          # This directory only contains MTS tests, not libnativehelper runtime.
+          if [ -d libnativehelper/tests_mts ]; then
+            echo "::notice::Pruning libnativehelper MTS test tree (libnativetesthelper_jni)."
+            rm -rf libnativehelper/tests_mts
+          fi
+
+          # Secretkeeper VTS pulls libdiced_open_dice and libsecretkeeper_client
+          # from the omitted Trusty/Virtualization/Secretkeeper stack.
+          # Keep the AIDL interface itself at .../aidl/; remove only the VTS
+          # subtree, which also contains a test CLI not selected for star2lte.
+          if [ -d hardware/interfaces/security/secretkeeper/aidl/vts ]; then
+            echo "::notice::Pruning Secretkeeper VTS test subtree (DICE dependencies)."
+            rm -rf hardware/interfaces/security/secretkeeper/aidl/vts
+          fi
+
+          # Guard the main runtime/interface source trees: these MUST remain.
+          test -f libnativehelper/Android.bp || {
+            echo "::error::Missing libnativehelper runtime Android.bp after pruning."
+            exit 1
+          }
+          test -f hardware/interfaces/security/secretkeeper/aidl/Android.bp || {
+            echo "::error::Missing Secretkeeper AIDL definition after pruning."
+            exit 1
+          }
+
           # Eigen is a real dependency of TensorFlow Lite and NeuralNetworks.
           # It must be present from the local manifest; do not replace it with a
           # graph shim.
@@ -886,6 +915,17 @@ jobs:
             echo "::error::system/authgraph/tests is still present in the CI diet tree."
             exit 1
           fi
+
+          # MTS/VTS modules must not be rediscovered during Soong graph creation.
+          for removed_test_path in \
+            libnativehelper/tests_mts \
+            hardware/interfaces/security/secretkeeper/aidl/vts
+          do
+            if [ -e "$removed_test_path" ]; then
+              echo "::error::CI-only test subtree was not pruned: $removed_test_path"
+              exit 1
+            fi
+          done
 
           for removed_path in             packages/apps/DeviceDiagnostics/TradeInModeTests             external/mesa3d             hardware/interfaces/automotive             build/make/tools/edit_monitor             build/make/tools/tool_event_logger
           do
