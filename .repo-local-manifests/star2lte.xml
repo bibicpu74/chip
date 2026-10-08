@@ -208,7 +208,9 @@
   <remove-project name="platform/prebuilts/module_sdk/StatsD" />
   <remove-project name="platform/prebuilts/module_sdk/Uwb" />
   <remove-project name="platform/prebuilts/module_sdk/Wifi" />
-  <remove-project name="platform/external/eigen" />
+  <!-- KEEP platform/external/eigen:
+       TensorFlow Lite and packages/modules/NeuralNetworks depend on libeigen.
+       This is a real runtime/build dependency, not test-only tooling. -->
   <remove-project name="platform/external/chromium-trace" />
   <remove-project name="platform/external/crosvm" />
 
@@ -385,5 +387,19 @@
          - platform-test-annotations
        Both are test/host providers from CTS/platform_testing and are not part
        of the star2lte runtime image. -->
+
+  <!-- ===== tier 12: restore real build/runtime providers discovered by Soong =====
+       external/eigen must remain synced because libtflite_* and NeuralNetworks
+       use the real header-only libeigen provider.
+
+       test/vts-testcase/hal remains removed as a whole because restoring the
+       full VTS HAL project would reintroduce a large test dependency graph.
+       The workflow instead stages only its tiny
+       treble/vintf/libvts_vintf_test_common subtree from the exact AOSP tag
+       used by LineageOS 22.2 (android-15.0.0_r32). This is required by the real
+       libassemblevintf / assemble_vintf host build path.
+
+       system/authgraph/tests stays pruned; a tiny Rust graph shim is supplied
+       only for libauthgraph_core_test, which is referenced by AuthGraph tests. -->
 
 </manifest>
