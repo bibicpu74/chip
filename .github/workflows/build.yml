@@ -197,6 +197,15 @@ jobs:
               -j4
           fi
 
+          # tools/asuite/atest is host-test tooling and depends on the removed
+          # Tradefed/loganalysis/suite_harness stack. The v3 local manifest
+          # removes it before sync; keep this fallback for runs that accidentally
+          # use an older local manifest.
+          if [ -d tools/asuite ]; then
+            echo "::warning::tools/asuite is present; removing it from the ephemeral CI tree."
+            rm -rf tools/asuite
+          fi
+
           echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
 
@@ -300,6 +309,45 @@ jobs:
           java_defaults {
               name: "MotionTestDefaults",
           }
+
+          // ===== Removed Tradefed / CTS / suite_harness host libraries =====
+          //
+          // These modules are referenced only by host-test/tooling stanzas that
+          // Soong still parses inside runtime repositories. They are deliberately
+          // empty because those tests/tools are not selected for the star2lte ROM.
+
+          java_library_host {
+              name: "tradefed",
+          }
+
+          java_library_host {
+              name: "compatibility-host-util",
+          }
+
+          java_library_host {
+              name: "cts-tradefed",
+          }
+
+          java_library_host {
+              name: "cts-install-lib-host",
+          }
+
+          java_library_host {
+              name: "loganalysis",
+          }
+
+          // ===== Optional AWS KMS dependencies removed from the diet tree =====
+          //
+          // tools/apksig keeps optional AWS KMS provider modules in its Android.bp.
+          // Normal Android ROM signing does not require these libraries.
+
+          java_library_host {
+              name: "awssdk-kms",
+          }
+
+          java_library_host {
+              name: "awssdk-url-connection-client",
+          }
           EOF
 
           echo "=== CI DIET SOONG STUBS ==="
@@ -319,7 +367,14 @@ jobs:
             avf_build_flags_cc \
             tradefed_errorprone_defaults \
             rdroidtest.defaults \
-            MotionTestDefaults
+            MotionTestDefaults \
+            tradefed \
+            compatibility-host-util \
+            cts-tradefed \
+            cts-install-lib-host \
+            loganalysis \
+            awssdk-kms \
+            awssdk-url-connection-client
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
               echo "::error::Missing CI diet Soong stub: ${module}"
@@ -331,6 +386,11 @@ jobs:
           # collide with the genuine platform/cts definitions.
           if [ -d cts ]; then
             echo "::error::platform/cts is present while CI stubs are enabled."
+            exit 1
+          fi
+
+          if [ -d tools/asuite ]; then
+            echo "::error::tools/asuite is still present in the CI diet tree."
             exit 1
           fi
 
