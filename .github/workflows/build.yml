@@ -258,6 +258,48 @@ jobs:
               name: "mts-target-sdk-version-current",
               target_sdk_version: "10000",
           }
+
+          // ===== Removed Automotive / Car providers =====
+
+          cc_defaults {
+              name: "vhalclient_defaults",
+          }
+
+          cc_defaults {
+              name: "android-automotive-large-parcelable-defaults",
+          }
+
+          cc_defaults {
+              name: "powerpolicyclient_defaults",
+          }
+
+          // ===== Removed AVF / Virtualization provider =====
+          //
+          // Only Microdroid/AVF variants currently reference this in the
+          // disk-diet graph. star2lte does not select those variants.
+
+          cc_defaults {
+              name: "avf_build_flags_cc",
+          }
+
+          // ===== Removed Tradefed provider =====
+
+          java_defaults {
+              name: "tradefed_errorprone_defaults",
+          }
+
+          // ===== Removed platform_testing providers =====
+
+          rust_defaults {
+              name: "rdroidtest.defaults",
+          }
+
+          // MotionTestDefaults is consumed only by SystemUI motion-test modules
+          // in this tree. A plain java_defaults shim is sufficient for Soong
+          // graph resolution because the tests are not selected for the ROM.
+          java_defaults {
+              name: "MotionTestDefaults",
+          }
           EOF
 
           echo "=== CI DIET SOONG STUBS ==="
@@ -270,7 +312,14 @@ jobs:
             cts_error_prone_rules_tests \
             cts_support_defaults \
             cts_defaults \
-            mts-target-sdk-version-current
+            mts-target-sdk-version-current \
+            vhalclient_defaults \
+            android-automotive-large-parcelable-defaults \
+            powerpolicyclient_defaults \
+            avf_build_flags_cc \
+            tradefed_errorprone_defaults \
+            rdroidtest.defaults \
+            MotionTestDefaults
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
               echo "::error::Missing CI diet Soong stub: ${module}"
