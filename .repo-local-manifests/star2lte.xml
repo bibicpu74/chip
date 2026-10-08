@@ -210,6 +210,7 @@
   <remove-project name="platform/prebuilts/module_sdk/Wifi" />
   <remove-project name="platform/external/eigen" />
   <remove-project name="platform/external/chromium-trace" />
+  <remove-project name="platform/external/crosvm" />
 
   <!-- tier 4: run #15 — trusty's lk.elf genrules need a dirgroup from
        packages/modules/Virtualization (removed); the whole trusty stack is
@@ -367,5 +368,22 @@
        compatibility-tradefed remains referenced by host-test modules living
        inside ART/deqp, so the workflow supplies one tiny java_library_host
        graph-resolution shim for it. -->
+
+  <!-- ===== tier 11: virtual-device/runtime-test leftovers =====
+       platform/external/crosvm is a VM/VMM stack used by AVF/Cuttlefish and
+       virtual graphics. Virtualization and gfxstream are intentionally absent
+       from this star2lte CI tree, so keeping crosvm leaves rutabaga_gfx with a
+       dangling libgfxstream_backend dependency.
+
+       system/authgraph itself is kept because it is system/security code, but
+       its tests are removed by the CI workflow after sync. Those tests depend
+       on libdiced_open_dice while the DICE/Virtualization-related provider
+       graph has been dieted.
+
+       The workflow also provides graph-only test shims for:
+         - cts-tradefed-harness
+         - platform-test-annotations
+       Both are test/host providers from CTS/platform_testing and are not part
+       of the star2lte runtime image. -->
 
 </manifest>
