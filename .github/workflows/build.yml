@@ -622,10 +622,9 @@ jobs:
               srcs: ["development-provider/scripts/symbol.py"],
           }
 
-          python_library_host {
-              name: "adb_py",
-              srcs: ["development-provider/python-packages/adb/*.py"],
-          }
+          // adb_py is NOT declared here: the staged upstream file
+          // development-provider/python-packages/adb/Android.bp already
+          // declares it. Keep that original module to avoid duplicate names.
 
           // ===== AuthGraph test helper removed with system/authgraph/tests =====
           //
@@ -645,6 +644,19 @@ jobs:
           sed -n '1,220p' ci-diet/Android.bp
 
           test -s ci-diet/Android.bp
+
+          # adb_py is defined in the upstream Android.bp staged in v14.
+          # Do not declare it again in the top-level CI-diet Android.bp.
+          ADB_BP="ci-diet/development-provider/python-packages/adb/Android.bp"
+          if [ ! -f "$ADB_BP" ] || ! grep -Eq 'name:[[:space:]]*"adb_py"' "$ADB_BP"; then
+            echo "::error::Missing original adb_py provider in $ADB_BP"
+            exit 1
+          fi
+          if grep -Eq 'name:[[:space:]]*"adb_py"' ci-diet/Android.bp; then
+            echo "::error::Duplicate adb_py declaration in ci-diet/Android.bp"
+            exit 1
+          fi
+          echo "Using upstream adb_py provider: $ADB_BP"
 
           for module in \
             cts_error_prone_rules \
@@ -679,7 +691,6 @@ jobs:
             compatibility-host-util-axt \
             platform_tools_version \
             python-symbol \
-            adb_py \
             libauthgraph_core_test
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
@@ -952,7 +963,7 @@ jobs:
 
           grep -n 'name: "platform_tools_version"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
           grep -n 'name: "python-symbol"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
-          grep -n 'name: "adb_py"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
+          grep -n 'name: "adb_py"' "$ANDROID_BUILD_TOP/ci-diet/development-provider/python-packages/adb/Android.bp"
           test -f "$ANDROID_BUILD_TOP/external/eigen/Android.bp"
           grep -n 'name: "libeigen"' "$ANDROID_BUILD_TOP/external/eigen/Android.bp" | head -1
 
@@ -961,7 +972,7 @@ jobs:
 
           echo "=== VERIFY CI DIET STUBS BEFORE SOONG ==="
           test -s "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
-          grep -n -E 'name: "(cts_defaults|cts_support_defaults|cts_error_prone_rules|cts_error_prone_rules_tests|mts-target-sdk-version-current|platform_tools_version|python-symbol|adb_py)"'             "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
+          grep -n -E 'name: "(cts_defaults|cts_support_defaults|cts_error_prone_rules|cts_error_prone_rules_tests|mts-target-sdk-version-current|platform_tools_version|python-symbol)"'             "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
 
           echo "=== GENERATE BUILD GRAPH ==="
           m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
