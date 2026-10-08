@@ -396,6 +396,24 @@ jobs:
             rm -rf hardware/interfaces/security/secretkeeper/aidl/vts
           fi
 
+          # v20: VtsHalHidlTestUtils comes from the removed VTS runner tree.
+          # Its remaining consumers are HAL VTS tests under hardware/interfaces.
+          # Prune only directories literally named "vts" inside that tree;
+          # preserve all HAL AIDL/HIDL implementation/interface definitions.
+          echo "=== PRUNE HARDWARE INTERFACES VTS TESTS ==="
+          while IFS= read -r -d '' vts_dir; do
+            echo "::notice::Removing VTS-only test directory: $vts_dir"
+            rm -rf -- "$vts_dir"
+          done < <(find hardware/interfaces -type d -name vts -prune -print0)
+
+          # libnativetesthelper_jni originates in the omitted CTS tree.
+          # libnativehelper/tests contains test modules only, separate from
+          # libnativehelper runtime and its public headers.
+          if [ -d libnativehelper/tests ]; then
+            echo "::notice::Pruning libnativehelper/tests (CTS JNI test-only dependency)."
+            rm -rf libnativehelper/tests
+          fi
+
           # Guard the main runtime/interface source trees: these MUST remain.
           test -f libnativehelper/Android.bp || {
             echo "::error::Missing libnativehelper runtime Android.bp after pruning."
@@ -819,6 +837,15 @@ jobs:
               name: "cts-shim-host-lib",
           }
 
+          // v20: platform_testing/libraries/flag-helpers/junit normally defines
+          // this *device* java_library. It is referenced by Ravenwood/test
+          // build-graph modules, which are not included in star2lte product.
+          // This shim is for Soong graph resolution only, not for running tests.
+          java_library {
+              name: "flag-junit",
+              sdk_version: "module_current",
+          }
+
           java_library_host {
               name: "flag-junit-host",
           }
@@ -949,6 +976,7 @@ jobs:
             cts-tradefed-harness \
             platform-test-annotations \
             cts-shim-host-lib \
+            flag-junit \
             flag-junit-host \
             cts-statsd-atom-host-test-utils \
             cts-host-utils \
@@ -994,6 +1022,7 @@ jobs:
           # MTS/VTS modules must not be rediscovered during Soong graph creation.
           for removed_test_path in \
             libnativehelper/tests_mts \
+            libnativehelper/tests \
             hardware/interfaces/security/secretkeeper/aidl/vts
           do
             if [ -e "$removed_test_path" ]; then
@@ -1001,6 +1030,11 @@ jobs:
               exit 1
             fi
           done
+
+          if find hardware/interfaces -type d -name vts -print -quit | grep -q .; then
+            echo "::error::hardware/interfaces VTS test directories remain after CI diet pruning."
+            exit 1
+          fi
 
           for removed_path in             packages/apps/DeviceDiagnostics/TradeInModeTests             external/mesa3d             hardware/interfaces/automotive             build/make/tools/edit_monitor             build/make/tools/tool_event_logger
           do
