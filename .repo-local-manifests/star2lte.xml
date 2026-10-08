@@ -312,4 +312,26 @@
        CTS/MTS, do NOT add tests to the product, and do NOT package test artifacts.
        Keep platform/cts removed unless a real runtime dependency proves otherwise. -->
 
+  <!-- ===== tier 8: CI-only provider defaults for removed heavy stacks =====
+       The disk-diet tree intentionally omits packages/services/Car,
+       packages/modules/Virtualization, platform_testing, and Tradefed.
+       Some source repositories that MUST remain for a normal star2lte build
+       still contain Automotive / Microdroid / VTS / host-test modules in their
+       Android.bp files. Soong parses those modules even when they are not part
+       of the star2lte product.
+
+       The workflow extends ci-diet/Android.bp with minimal compatibility
+       defaults for:
+         - vhalclient_defaults
+         - android-automotive-large-parcelable-defaults
+         - powerpolicyclient_defaults
+         - avf_build_flags_cc
+         - tradefed_errorprone_defaults
+         - rdroidtest.defaults
+         - MotionTestDefaults
+
+       These are graph-resolution shims only. They do NOT restore Car,
+       Virtualization, VTS, Tradefed, or platform_testing and are not intended
+       to make those removed test/virtualization products buildable. -->
+
 </manifest>
