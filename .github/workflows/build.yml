@@ -230,6 +230,39 @@ jobs:
             rm -rf system/authgraph/tests
           fi
 
+          # DeviceDiagnostics TradeInModeTests depend on VTS helper libraries
+          # that are intentionally absent. Keep the app, prune only its tests.
+          if [ -d packages/apps/DeviceDiagnostics/TradeInModeTests ]; then
+            echo "::warning::Pruning DeviceDiagnostics TradeInModeTests."
+            rm -rf packages/apps/DeviceDiagnostics/TradeInModeTests
+          fi
+
+          # Mesa's gfxstream guest platform is for virtual GPU guests and pulls
+          # virtgpu_kumquat_* from crosvm. Physical star2lte does not use it.
+          if [ -d external/mesa3d/src/gfxstream ]; then
+            echo "::warning::Pruning Mesa gfxstream guest subtree."
+            rm -rf external/mesa3d/src/gfxstream
+          fi
+
+          # The complete hardware/interfaces/automotive subtree is irrelevant
+          # for star2lte and otherwise depends on packages/services/Car.
+          if [ -d hardware/interfaces/automotive ]; then
+            echo "::warning::Pruning hardware/interfaces/automotive."
+            rm -rf hardware/interfaces/automotive
+          fi
+
+          # These two build/make utilities are telemetry/editor monitoring tools.
+          # Their only missing provider here is asuite_cc_client from the dieted
+          # Asuite tree; they are not required to produce the ROM.
+          if [ -d build/make/tools/edit_monitor ]; then
+            echo "::warning::Pruning build edit_monitor telemetry tool."
+            rm -rf build/make/tools/edit_monitor
+          fi
+          if [ -d build/make/tools/tool_event_logger ]; then
+            echo "::warning::Pruning build tool_event_logger telemetry tool."
+            rm -rf build/make/tools/tool_event_logger
+          fi
+
           # Eigen is a real dependency of TensorFlow Lite and NeuralNetworks.
           # It must be present from the local manifest; do not replace it with a
           # graph shim.
@@ -327,6 +360,53 @@ jobs:
           #![allow(dead_code)]
           pub fn ci_diet_placeholder() {}
           EOF_RUST
+
+          # ===== Minimal REAL providers from platform/development =====
+          #
+          # The manifest intentionally removes the full development project
+          # because development/build pulls SDK-packaging prebuilts that are not
+          # needed for a ROM. However ADB/Fastboot/recovery need three providers:
+          #   platform_tools_version  (development/sdk)
+          #   python-symbol           (development/scripts)
+          #   adb_py                  (development/python-packages)
+          #
+          # Stage only their real source files from the exact AOSP release that
+          # matches BUILD_ID=BP1A.250505.005.
+          DEV_AOSP_TAG="android-15.0.0_r32"
+          DEV_STAGE_DIR="ci-diet/development-provider"
+          DEV_TMP_DIR="$(mktemp -d)"
+
+          rm -rf "$DEV_STAGE_DIR"
+          mkdir -p             "$DEV_STAGE_DIR/sdk"             "$DEV_STAGE_DIR/scripts"             "$DEV_STAGE_DIR/python-packages"
+
+          echo "Fetching minimal platform/development providers from ${DEV_AOSP_TAG}..."
+          git clone             --depth=1             --filter=blob:none             --sparse             --branch "$DEV_AOSP_TAG"             https://android.googlesource.com/platform/development             "$DEV_TMP_DIR/development"
+
+          git -C "$DEV_TMP_DIR/development" sparse-checkout set             sdk             scripts             python-packages
+
+          cp             "$DEV_TMP_DIR/development/sdk/plat_tools_source.prop_template"             "$DEV_STAGE_DIR/sdk/"
+
+          cp             "$DEV_TMP_DIR/development/scripts/symbol.py"             "$DEV_STAGE_DIR/scripts/"
+
+          mkdir -p "$DEV_STAGE_DIR/python-packages/adb"
+          cp -a             "$DEV_TMP_DIR/development/python-packages/adb/."             "$DEV_STAGE_DIR/python-packages/adb/"
+
+          rm -rf "$DEV_TMP_DIR"
+
+          if [ ! -f "$DEV_STAGE_DIR/sdk/plat_tools_source.prop_template" ]; then
+            echo "::error::Missing staged platform_tools_version input."
+            exit 1
+          fi
+          if [ ! -f "$DEV_STAGE_DIR/scripts/symbol.py" ]; then
+            echo "::error::Missing staged python-symbol source."
+            exit 1
+          fi
+          if ! find "$DEV_STAGE_DIR/python-packages/adb" -type f -name '*.py' -print -quit | grep -q .; then
+            echo "::error::Missing staged adb_py sources."
+            exit 1
+          fi
+
+          echo "Minimal development providers staged successfully."
 
           cat > ci-diet/Android.bp <<'EOF'
           // CI-only compatibility stubs for the disk-diet star2lte source tree.
@@ -525,6 +605,28 @@ jobs:
               name: "compatibility-host-util-axt",
           }
 
+          // ===== REAL platform/development providers =====
+          //
+          // These use upstream source files staged from android-15.0.0_r32.
+          // They are not empty graph shims.
+
+          genrule {
+              name: "platform_tools_version",
+              cmd: "sed 's/$${PLATFORM_SDK_VERSION}/0/ ; s/^Pkg.Revision=\\(.*\\)/#define PLATFORM_TOOLS_VERSION \"\\1\"/p ; d' $(in) > $(out)",
+              srcs: ["development-provider/sdk/plat_tools_source.prop_template"],
+              out: ["platform_tools_version.h"],
+          }
+
+          python_library_host {
+              name: "python-symbol",
+              srcs: ["development-provider/scripts/symbol.py"],
+          }
+
+          python_library_host {
+              name: "adb_py",
+              srcs: ["development-provider/python-packages/adb/*.py"],
+          }
+
           // ===== AuthGraph test helper removed with system/authgraph/tests =====
           //
           // This is test-only. The real AuthGraph runtime libraries remain in
@@ -575,6 +677,9 @@ jobs:
             cts-statsd-atom-host-test-utils \
             cts-host-utils \
             compatibility-host-util-axt \
+            platform_tools_version \
+            python-symbol \
+            adb_py \
             libauthgraph_core_test
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
@@ -609,6 +714,14 @@ jobs:
             echo "::error::system/authgraph/tests is still present in the CI diet tree."
             exit 1
           fi
+
+          for removed_path in             packages/apps/DeviceDiagnostics/TradeInModeTests             external/mesa3d/src/gfxstream             hardware/interfaces/automotive             build/make/tools/edit_monitor             build/make/tools/tool_event_logger
+          do
+            if [ -e "$removed_path" ]; then
+              echo "::error::CI diet path still exists: $removed_path"
+              exit 1
+            fi
+          done
 
           if ! grep -q 'srcs: \["cts-json/src/\*\*/\*.java"\]' ci-diet/Android.bp; then
             echo "::error::json provider is not backed by staged local org.json sources."
@@ -833,6 +946,13 @@ jobs:
           fi
 
           echo "=== VERIFY REAL RESTORED/STAGED PROVIDERS ==="
+          test -f "$ANDROID_BUILD_TOP/ci-diet/development-provider/sdk/plat_tools_source.prop_template"
+          test -f "$ANDROID_BUILD_TOP/ci-diet/development-provider/scripts/symbol.py"
+          test -n "$(find "$ANDROID_BUILD_TOP/ci-diet/development-provider/python-packages/adb" -type f -name '*.py' -print -quit)"
+
+          grep -n 'name: "platform_tools_version"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
+          grep -n 'name: "python-symbol"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
+          grep -n 'name: "adb_py"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
           test -f "$ANDROID_BUILD_TOP/external/eigen/Android.bp"
           grep -n 'name: "libeigen"' "$ANDROID_BUILD_TOP/external/eigen/Android.bp" | head -1
 
@@ -841,7 +961,7 @@ jobs:
 
           echo "=== VERIFY CI DIET STUBS BEFORE SOONG ==="
           test -s "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
-          grep -n -E 'name: "(cts_defaults|cts_support_defaults|cts_error_prone_rules|cts_error_prone_rules_tests|mts-target-sdk-version-current)"'             "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
+          grep -n -E 'name: "(cts_defaults|cts_support_defaults|cts_error_prone_rules|cts_error_prone_rules_tests|mts-target-sdk-version-current|platform_tools_version|python-symbol|adb_py)"'             "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
 
           echo "=== GENERATE BUILD GRAPH ==="
           m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
