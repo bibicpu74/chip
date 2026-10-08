@@ -422,6 +422,27 @@ jobs:
           done
           echo "Pruned ${vts_removed} VTS test directories from scoped trees."
 
+          # v22: BufferPool 2.0 stores VTS HIDL test modules in a directory
+          # named "tests" rather than "vts". The v21 directory-name scan
+          # cannot see these test-only consumers of VtsHalHidlTestUtils.
+          # Preserve the BufferPool runtime Android.bp and implementation.
+          BUFFERPOOL_VTS_TEST_DIR="frameworks/av/media/module/bufferpool/2.0/tests"
+          BUFFERPOOL_RUNTIME_BP="frameworks/av/media/module/bufferpool/2.0/Android.bp"
+          if [ -d "$BUFFERPOOL_VTS_TEST_DIR" ]; then
+            if [ ! -f "$BUFFERPOOL_VTS_TEST_DIR/Android.bp" ] || \
+               ! grep -q 'VtsVndkHidlBufferpoolV2_0TargetSingleTest' \
+                 "$BUFFERPOOL_VTS_TEST_DIR/Android.bp"; then
+              echo "::error::Unexpected BufferPool test layout; refusing to remove this directory."
+              exit 1
+            fi
+            echo "::notice::Pruning BufferPool 2.0 VTS-only tests."
+            rm -rf -- "$BUFFERPOOL_VTS_TEST_DIR"
+          fi
+          if [ ! -f "$BUFFERPOOL_RUNTIME_BP" ]; then
+            echo "::error::BufferPool 2.0 runtime Android.bp is missing."
+            exit 1
+          fi
+
           # libnativetesthelper_jni originates in the omitted CTS tree.
           # libnativehelper/tests contains test modules only, separate from
           # libnativehelper runtime and its public headers.
@@ -672,6 +693,37 @@ jobs:
           trap - EXIT
           echo "Real libflagtest source staged from ${FLAGTEST_TAG}."
 
+          # v22: aconfigd/libaconfigd genuinely depends on the generated
+          # CTS flag C++ implementation. Recreate only the three upstream flag
+          # declarations from platform/cts/flags/tests/aconfig, not an empty
+          # cc_library shim. Do not change the aconfigd runtime Android.bp.
+          mkdir -p ci-diet/cts-flags
+          cat > ci-diet/cts-flags/android.cts.flags.tests.aconfig <<'EOF_CTS_FLAGS'
+          // Minimal CTS flag declarations for the LineageOS CI-diet build.
+          // Matches the flag package/names used by platform/cts.
+          package: "android.cts.flags.tests"
+          container: "system"
+          flag {
+            name: "readwrite_disabled_flag"
+            namespace: "cts"
+            description: "testing flag that is always disabled"
+            bug: "<none>"
+          }
+          flag {
+            name: "readwrite_disabled_flag_2"
+            namespace: "cts"
+            description: "another testing flag that is always disabled"
+            bug: "<none>"
+          }
+          flag {
+            name: "readwrite_enabled_flag"
+            namespace: "cts"
+            description: "testing flag that is always enabled"
+            bug: "<none>"
+          }
+          EOF_CTS_FLAGS
+          test -s ci-diet/cts-flags/android.cts.flags.tests.aconfig
+
           cat > ci-diet/Android.bp <<'EOF'
           // CI-only compatibility stubs for the disk-diet star2lte source tree.
           //
@@ -899,6 +951,22 @@ jobs:
           // development-provider/python-packages/adb/Android.bp already
           // declares it. Keep that original module to avoid duplicate names.
 
+          // ===== Real generated CTS flag provider used by aconfigd =====
+          // platform/cts is intentionally absent. Its original provider is a
+          // cc_aconfig_library, generated from aconfig declarations; do not
+          // replace it with a stub cc_library or remove it from libaconfigd.
+          aconfig_declarations {
+              name: "cts_flags_tests",
+              package: "android.cts.flags.tests",
+              container: "system",
+              srcs: ["cts-flags/android.cts.flags.tests.aconfig"],
+          }
+
+          cc_aconfig_library {
+              name: "cts_flags_tests_cc",
+              aconfig_declarations: "cts_flags_tests",
+          }
+
           // ===== Real libflagtest from platform_testing (test-only) =====
           // Bluetooth and framework cc_test modules need both its symbols and
           // the public flag_macros.h header. These are genuine upstream sources,
@@ -1062,6 +1130,23 @@ jobs:
               exit 1
             fi
           done
+
+          # v22: verify the additional BufferPool VTS-only test subtree was
+          # removed while its sibling runtime Android.bp remains untouched.
+          if [ -e frameworks/av/media/module/bufferpool/2.0/tests ]; then
+            echo "::error::BufferPool 2.0 VTS test subtree still exists."
+            exit 1
+          fi
+          test -f frameworks/av/media/module/bufferpool/2.0/Android.bp
+
+          # v22: fail before Soong if the *real* CTS AConfig provider is missing.
+          test -s ci-diet/cts-flags/android.cts.flags.tests.aconfig
+          grep -q 'name: "cts_flags_tests_cc"' ci-diet/Android.bp
+          grep -q 'aconfig_declarations: "cts_flags_tests"' ci-diet/Android.bp
+          if grep -R -l --include='Android.bp' 'name: "cts_flags_tests_cc"' cts 2>/dev/null; then
+            echo "::error::Unexpected duplicate CTS flags provider in cts/."
+            exit 1
+          fi
 
           for removed_path in             packages/apps/DeviceDiagnostics/TradeInModeTests             external/mesa3d             hardware/interfaces/automotive             build/make/tools/edit_monitor             build/make/tools/tool_event_logger
           do
