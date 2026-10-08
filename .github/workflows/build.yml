@@ -249,6 +249,26 @@ jobs:
           # modules do not build or package CTS/MTS.
           mkdir -p ci-diet
 
+          # ProtoLogTool is a real framework build tool and needs actual org.json
+          # classes at compile/runtime. Do NOT satisfy json/jsonlib with empty
+          # graph shims. Pull only the tiny CTS libs/json subtree from the exact
+          # AOSP tag matching BUILD_ID=BP1A.250505.005.
+          CTS_JSON_TAG="android-15.0.0_r32"
+          CTS_JSON_DIR="ci-diet/cts-json"
+
+          rm -rf "$CTS_JSON_DIR"
+          mkdir -p "$CTS_JSON_DIR"
+
+          echo "Fetching minimal CTS JSON sources from ${CTS_JSON_TAG}..."
+          curl -fsSL --retry 3 --retry-delay 2             "https://android.googlesource.com/platform/cts/+archive/refs/tags/${CTS_JSON_TAG}/libs/json.tar.gz"             | tar -xz -C "$CTS_JSON_DIR"
+
+          if [ ! -f "$CTS_JSON_DIR/src/org/json/JSONObject.java" ]; then
+            echo "::error::Failed to fetch real CTS json sources."
+            exit 1
+          fi
+
+          echo "CTS JSON source count: $(find "$CTS_JSON_DIR/src" -type f -name '*.java' | wc -l)"
+
           cat > ci-diet/Android.bp <<'EOF'
           // CI-only compatibility stubs for the disk-diet star2lte source tree.
           //
@@ -382,10 +402,23 @@ jobs:
           // libcore/tools/non-cts-json-generator is host-side non-CTS tooling.
           // Match the upstream provider module kinds so Soong can resolve graph.
 
+          // ===== Real CTS JSON provider needed by framework ProtoLogTool =====
+          //
+          // Unlike most entries in this file, json/jsonlib are NOT empty graph
+          // shims. frameworks/base/tools/protologtool is a real host build tool
+          // and must compile/run against actual org.json classes.
+
           java_library {
               name: "json",
               host_supported: true,
+              srcs: ["cts-json/src/**/*.java"],
               sdk_version: "current",
+              java_version: "11",
+          }
+
+          java_library_host {
+              name: "jsonlib",
+              static_libs: ["json"],
           }
 
           java_library_host {
@@ -405,6 +438,32 @@ jobs:
           java_library_static {
               name: "platform-test-annotations",
               host_supported: true,
+          }
+
+          // ===== Remaining CTS / platform_testing host-test providers =====
+          //
+          // These are referenced only by host-test modules that Soong parses.
+          // They are not selected for the star2lte ROM, so empty host providers
+          // are sufficient for graph resolution.
+
+          java_library_host {
+              name: "cts-shim-host-lib",
+          }
+
+          java_library_host {
+              name: "flag-junit-host",
+          }
+
+          java_library_host {
+              name: "cts-statsd-atom-host-test-utils",
+          }
+
+          java_library_host {
+              name: "cts-host-utils",
+          }
+
+          java_library_host {
+              name: "compatibility-host-util-axt",
           }
           EOF
 
@@ -436,8 +495,14 @@ jobs:
             compatibility-tradefed \
             json \
             vogarexpectlib \
+            jsonlib \
             cts-tradefed-harness \
-            platform-test-annotations
+            platform-test-annotations \
+            cts-shim-host-lib \
+            flag-junit-host \
+            cts-statsd-atom-host-test-utils \
+            cts-host-utils \
+            compatibility-host-util-axt
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
               echo "::error::Missing CI diet Soong stub: ${module}"
@@ -469,6 +534,16 @@ jobs:
 
           if [ -d system/authgraph/tests ]; then
             echo "::error::system/authgraph/tests is still present in the CI diet tree."
+            exit 1
+          fi
+
+          if ! grep -q 'srcs: \["cts-json/src/\*\*/\*.java"\]' ci-diet/Android.bp; then
+            echo "::error::json provider is not backed by real CTS sources."
+            exit 1
+          fi
+
+          if ! grep -q 'name: "jsonlib"' ci-diet/Android.bp; then
+            echo "::error::jsonlib provider is missing."
             exit 1
           fi
 
