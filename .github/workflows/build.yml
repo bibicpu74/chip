@@ -396,15 +396,31 @@ jobs:
             rm -rf hardware/interfaces/security/secretkeeper/aidl/vts
           fi
 
-          # v20: VtsHalHidlTestUtils comes from the removed VTS runner tree.
-          # Its remaining consumers are HAL VTS tests under hardware/interfaces.
-          # Prune only directories literally named "vts" inside that tree;
-          # preserve all HAL AIDL/HIDL implementation/interface definitions.
-          echo "=== PRUNE HARDWARE INTERFACES VTS TESTS ==="
-          while IFS= read -r -d '' vts_dir; do
-            echo "::notice::Removing VTS-only test directory: $vts_dir"
-            rm -rf -- "$vts_dir"
-          done < <(find hardware/interfaces -type d -name vts -prune -print0)
+          # v21: VtsHalHidlTestUtils is provided by the removed VTS test stack.
+          # v20 pruned only hardware/interfaces/**/vts, but additional test-only
+          # consumers remain under frameworks/hardware, frameworks/av and
+          # system/hardware. Keep all HAL/framework/system runtime source; prune
+          # ONLY directories whose basename is exactly "vts" in these scopes.
+          echo "=== PRUNE ALL REMAINING SCOPED VTS TESTS ==="
+          VTS_TEST_SCOPES=(
+            hardware/interfaces
+            frameworks/hardware/interfaces
+            frameworks/av
+            system/hardware/interfaces
+          )
+          vts_removed=0
+          for scope in "${VTS_TEST_SCOPES[@]}"; do
+            if [ ! -d "$scope" ]; then
+              echo "::warning::VTS prune scope absent: $scope"
+              continue
+            fi
+            while IFS= read -r -d '' vts_dir; do
+              echo "::notice::Removing VTS-only test directory: $vts_dir"
+              rm -rf -- "$vts_dir"
+              vts_removed=$((vts_removed + 1))
+            done < <(find "$scope" -type d -name vts -prune -print0)
+          done
+          echo "Pruned ${vts_removed} VTS test directories from scoped trees."
 
           # libnativetesthelper_jni originates in the omitted CTS tree.
           # libnativehelper/tests contains test modules only, separate from
@@ -1031,10 +1047,21 @@ jobs:
             fi
           done
 
-          if find hardware/interfaces -type d -name vts -print -quit | grep -q .; then
-            echo "::error::hardware/interfaces VTS test directories remain after CI diet pruning."
-            exit 1
-          fi
+          # v21: Ensure Soong cannot rediscover VtsHalHidlTestUtils consumers
+          # from any of the four explicitly scoped VTS-only test trees.
+          for scope in \
+            hardware/interfaces \
+            frameworks/hardware/interfaces \
+            frameworks/av \
+            system/hardware/interfaces
+          do
+            if [ -d "$scope" ] && \
+               find "$scope" -type d -name vts -print -quit | grep -q .; then
+              echo "::error::VTS test directories remain under: $scope"
+              find "$scope" -type d -name vts -prune -print | head -30
+              exit 1
+            fi
+          done
 
           for removed_path in             packages/apps/DeviceDiagnostics/TradeInModeTests             external/mesa3d             hardware/interfaces/automotive             build/make/tools/edit_monitor             build/make/tools/tool_event_logger
           do
