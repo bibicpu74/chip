@@ -230,6 +230,14 @@ jobs:
             rm -rf system/authgraph/tests
           fi
 
+          # Eigen is a real dependency of TensorFlow Lite and NeuralNetworks.
+          # It must be present from the local manifest; do not replace it with a
+          # graph shim.
+          if [ ! -f external/eigen/Android.bp ]; then
+            echo "::error::external/eigen is missing. Use the v6 CI-diet manifest that keeps platform/external/eigen."
+            exit 1
+          fi
+
           echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
 
@@ -278,6 +286,47 @@ jobs:
           echo "Using org.json sources from current libcore revision."
           echo "JSON source count: $(find "$CTS_JSON_DIR/src/org/json" -type f -name '*.java' | wc -l)"
           find "$CTS_JSON_DIR/src/org/json" -maxdepth 1 -type f -name '*.java' -printf '%f\n' | sort
+
+          # libassemblevintf / assemble_vintf are real host build tools and
+          # depend on libvts_vintf_test_common. Restoring the whole VTS HAL repo
+          # would bring back a large test graph, so stage only the exact provider
+          # subtree from the AOSP tag used by LineageOS 22.2.
+          VTS_AOSP_TAG="android-15.0.0_r32"
+          VTS_STAGE_DIR="ci-diet/vts-vintf-common"
+          VTS_TMP_DIR="$(mktemp -d)"
+
+          rm -rf "$VTS_STAGE_DIR"
+          mkdir -p "$VTS_STAGE_DIR"
+
+          echo "Fetching minimal libvts_vintf_test_common from ${VTS_AOSP_TAG}..."
+          git clone             --depth=1             --filter=blob:none             --sparse             --branch "$VTS_AOSP_TAG"             https://android.googlesource.com/platform/test/vts-testcase/hal             "$VTS_TMP_DIR/hal"
+
+          git -C "$VTS_TMP_DIR/hal" sparse-checkout set             treble/vintf/libvts_vintf_test_common
+
+          cp -a             "$VTS_TMP_DIR/hal/treble/vintf/libvts_vintf_test_common/."             "$VTS_STAGE_DIR/"
+
+          rm -rf "$VTS_TMP_DIR"
+
+          if [ ! -f "$VTS_STAGE_DIR/Android.bp" ] ||              [ ! -f "$VTS_STAGE_DIR/common.cpp" ]; then
+            echo "::error::Failed to stage real libvts_vintf_test_common sources."
+            exit 1
+          fi
+
+          if ! grep -q 'name: "libvts_vintf_test_common"' "$VTS_STAGE_DIR/Android.bp"; then
+            echo "::error::Staged VTS VINTF provider does not define libvts_vintf_test_common."
+            cat "$VTS_STAGE_DIR/Android.bp"
+            exit 1
+          fi
+
+          # system/authgraph/tests is intentionally pruned. The remaining
+          # boringssl/core test modules still reference libauthgraph_core_test.
+          # Provide only a tiny Rust test-helper graph shim; it is not selected
+          # for the star2lte ROM.
+          mkdir -p ci-diet/authgraph-core-test
+          cat > ci-diet/authgraph-core-test/lib.rs <<'EOF_RUST'
+          #![allow(dead_code)]
+          pub fn ci_diet_placeholder() {}
+          EOF_RUST
 
           cat > ci-diet/Android.bp <<'EOF'
           // CI-only compatibility stubs for the disk-diet star2lte source tree.
@@ -475,6 +524,19 @@ jobs:
           java_library_host {
               name: "compatibility-host-util-axt",
           }
+
+          // ===== AuthGraph test helper removed with system/authgraph/tests =====
+          //
+          // This is test-only. The real AuthGraph runtime libraries remain in
+          // system/authgraph. Both Android and host variants are provided so
+          // unselected rust_test modules can resolve their graph.
+
+          rust_library {
+              name: "libauthgraph_core_test",
+              crate_name: "authgraph_core_test",
+              srcs: ["authgraph-core-test/lib.rs"],
+              host_supported: true,
+          }
           EOF
 
           echo "=== CI DIET SOONG STUBS ==="
@@ -512,7 +574,8 @@ jobs:
             flag-junit-host \
             cts-statsd-atom-host-test-utils \
             cts-host-utils \
-            compatibility-host-util-axt
+            compatibility-host-util-axt \
+            libauthgraph_core_test
           do
             if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
               echo "::error::Missing CI diet Soong stub: ${module}"
@@ -768,6 +831,13 @@ jobs:
           else
             echo "Virtualization tree is present; no CI diet sepolicy verification required."
           fi
+
+          echo "=== VERIFY REAL RESTORED/STAGED PROVIDERS ==="
+          test -f "$ANDROID_BUILD_TOP/external/eigen/Android.bp"
+          grep -n 'name: "libeigen"' "$ANDROID_BUILD_TOP/external/eigen/Android.bp" | head -1
+
+          test -f "$ANDROID_BUILD_TOP/ci-diet/vts-vintf-common/Android.bp"
+          grep -n 'name: "libvts_vintf_test_common"'             "$ANDROID_BUILD_TOP/ci-diet/vts-vintf-common/Android.bp"
 
           echo "=== VERIFY CI DIET STUBS BEFORE SOONG ==="
           test -s "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
