@@ -598,9 +598,69 @@ jobs:
         timeout-minutes: 325
         shell: bash
         run: |
-          set -eo pipefail
-
+          set -Eeo pipefail
           mkdir -p /tmp/rbe-test
+
+          # P0.1: capture early setup output, even when envsetup or lunch fails
+          # before m-nothing.log / rbe-env.txt can be created.
+          # Preserve Actions stdout/stderr to avoid duplicating long build logs.
+          exec 3>&1 4>&2
+          exec > >(tee -a /tmp/rbe-test/configure-setup.log) 2>&1
+          CURRENT_STAGE=configure-start
+          LAST_FAILURE_LINE=''
+          LAST_FAILURE_COMMAND=''
+          BUILD_PID=''
+          mark_stage() {
+            CURRENT_STAGE="$1"
+            printf '[%s] STAGE: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$CURRENT_STAGE" \
+              | tee -a /tmp/rbe-test/configure-stages.log
+          }
+          on_error() {
+            LAST_FAILURE_LINE="$1"
+            LAST_FAILURE_COMMAND="$2"
+            # Never enable set -x: BuildBuddy credentials are in the environment.
+            printf 'Failure observed at line=%s in stage=%s\n' "$LAST_FAILURE_LINE" "$CURRENT_STAGE"
+          }
+          on_exit() {
+            local rc=$?
+            trap - EXIT
+            # Retain the original process-tree cleanup if build is interrupted.
+            if [ -n "${BUILD_PID:-}" ] && kill -0 "$BUILD_PID" 2>/dev/null; then
+              if declare -F stop_process_tree >/dev/null; then
+                stop_process_tree "$BUILD_PID" || true
+              fi
+            fi
+            if [ "$rc" -ne 0 ]; then
+              {
+                printf 'exit_code=%s\n' "$rc"
+                printf 'stage=%s\n' "$CURRENT_STAGE"
+                printf 'error_line=%s\n' "${LAST_FAILURE_LINE:-unavailable}"
+                printf 'error_command=%s\n' "${LAST_FAILURE_COMMAND:-unavailable}"
+                printf 'timestamp=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+              } > /tmp/rbe-test/configure-failure.txt
+              echo "::error::Configure failed: stage=$CURRENT_STAGE exit=$rc line=${LAST_FAILURE_LINE:-unknown}"
+              echo '=== FAILURE DISK / MEMORY SNAPSHOT ==='
+              df -h /home/runner/work/los || true
+              free -h || true
+              du -sh out 2>/dev/null || true
+            else
+              printf 'exit_code=0\nstage=%s\n' "$CURRENT_STAGE" \
+                > /tmp/rbe-test/configure-success.txt
+            fi
+          }
+          trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+          trap on_exit EXIT
+          mark_stage configure-start
+
+          echo "=== DATE / OS / SHELL ==="
+          date -u +'%Y-%m-%dT%H:%M:%SZ'
+          pwd -P
+          bash --version | head -1
+          echo "=== JAVA CANDIDATES (NO OVERRIDE YET) ==="
+          command -v java || true
+          java -version 2>&1 || true
+          ls -ld prebuilts/jdk/jdk11/linux-x86 prebuilts/jdk/jdk17/linux-x86 \
+            2>/dev/null || true
 
           # LineageOS 20.0 uses PRODUCT-VARIANT format.
           # TARGET_RELEASE and aosp_target_release are for newer build trees.
@@ -608,8 +668,13 @@ jobs:
             echo "::error::Missing build/envsetup.sh; check repo sync and working-directory."
             exit 1
           fi
+          mark_stage envsetup
           source build/envsetup.sh
+          echo '=== ENVSETUP PASSED ==='
+          mark_stage lunch
           lunch lineage_star2lte-userdebug
+          echo '=== LUNCH PASSED ==='
+          mark_stage java-selection
 
           # Prefer the checked-out JDK 11 if this tree selects it.
           # RBE and Android Soong toolchain remain otherwise unchanged.
@@ -647,6 +712,7 @@ jobs:
           export RBE_exec_root="$(dirname "$(pwd -P)")"
           RBE_REL_WORKDIR="$(realpath --relative-to="$RBE_exec_root" "$(pwd -P)")"
 
+          mark_stage rbe-configuration
           echo "=== RBE WORKING DIRECTORY COMPATIBILITY ==="
           echo "RBE_exec_root=$RBE_exec_root"
           echo "RBE_REL_WORKDIR=$RBE_REL_WORKDIR"
@@ -711,6 +777,11 @@ jobs:
           }
           enforce_initial_disk_guard pre-graph
 
+          mark_stage build-graph
+          # From here m-nothing.log and full-rom-build.log capture build output.
+          # Do not mirror many gigabytes of compiler output into configure-setup.log.
+          exec 1>&3 2>&4
+          exec 3>&- 4>&-
           echo "=== GENERATE BUILD GRAPH ==="
           m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
           enforce_initial_disk_guard post-graph
@@ -736,6 +807,7 @@ jobs:
 
           echo "BUILD_NINJA=$BUILD_NINJA" | tee /tmp/rbe-test/build-ninja.txt
 
+          mark_stage verify-rbe-graph
           echo "=== VERIFY REWRAPPER IS PRESENT IN GENERATED GRAPH ==="
           : > /tmp/rbe-test/rewrapper-ninja-matches.txt
           FOUND_REWRAPPER=0
@@ -766,6 +838,7 @@ jobs:
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/reproxy"
 
+          mark_stage pre-build
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
           echo "RBE remote-only enabled; jobs=2, highmem=1, no local ccache."
           echo "The previous libbase test passed; this run compiles and packages the full ROM."
@@ -790,6 +863,7 @@ jobs:
             exit 71
           fi
 
+          mark_stage full-rom-build
           # Run the build in a child shell and keep its exit status after tee.
           # The supervisor retains control to stop on low disk/time.
           (
@@ -815,8 +889,7 @@ jobs:
               stop_process_tree "$BUILD_PID"
             fi
           }
-          trap cleanup_build_supervisor EXIT
-
+          # The single on_exit trap handles both child cleanup and stage logs.
           echo '=== FULL ROM STORAGE / MEMORY / TIME MONITOR (30s) ==='
           : > /tmp/rbe-test/resource-monitor.log
           WARNED=0
@@ -856,7 +929,7 @@ jobs:
           wait "$BUILD_PID"
           WAIT_RC=$?
           set -e
-          trap - EXIT
+          BUILD_PID=''
           BUILD_RC="$WAIT_RC"
           if [ -s "$BUILD_STATUS_FILE" ]; then
             BUILD_RC="$(cat "$BUILD_STATUS_FILE")"
@@ -877,6 +950,7 @@ jobs:
             exit "$BUILD_RC"
           fi
 
+          mark_stage verify-rom-zip
           # A successful Ninja exit alone is not enough: verify flashable ZIP.
           ROM_DIR="$ANDROID_BUILD_TOP/out/target/product/star2lte"
           echo "=== ROM OUTPUT DIRECTORY ==="
@@ -900,6 +974,7 @@ jobs:
           echo "=== FULL ROM BUILD PASSED ==="
           echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_BUILD_VARIANT}"
           echo 'Full bacon target completed with remote C++ compilation enabled.'
+          mark_stage complete
 
       - name: Upload completed LineageOS ROM
         if: success()
@@ -1007,6 +1082,23 @@ jobs:
               echo '```'
             fi
             echo ''
+            echo '### Configure stage (P0.1 diagnostics)'
+            if [ -s /tmp/rbe-test/configure-failure.txt ]; then
+              echo '**The configure/build step exited with an error:**'
+              echo '```text'
+              cat /tmp/rbe-test/configure-failure.txt
+              echo '```'
+            elif [ -s /tmp/rbe-test/configure-success.txt ]; then
+              echo 'Configure/build step completed successfully.'
+            else
+              echo 'Configure/build step did not record a final exit status.'
+            fi
+            if [ -s /tmp/rbe-test/configure-stages.log ]; then
+              echo '```text'
+              tail -n 20 /tmp/rbe-test/configure-stages.log
+              echo '```'
+            fi
+            echo ''
             echo '### ROM output'
             if [ -s /tmp/rbe-test/rom-filename.txt ]; then
               echo "ROM ZIP: **$(cat /tmp/rbe-test/rom-filename.txt)**"
@@ -1045,6 +1137,13 @@ jobs:
 
           echo "=== SAFE RBE ENV ==="
           cat /tmp/rbe-test/rbe-env.txt 2>/dev/null || true
+
+          echo '=== CONFIGURE / LUNCH FAILURE SUMMARY ==='
+          cat /tmp/rbe-test/configure-failure.txt 2>/dev/null || true
+          echo '=== CONFIGURE STAGES ==='
+          cat /tmp/rbe-test/configure-stages.log 2>/dev/null || true
+          echo '=== CONFIGURE LOG TAIL (LAST 180 LINES) ==='
+          tail -n 180 /tmp/rbe-test/configure-setup.log 2>/dev/null || true
 
           echo "=== RBE LOG DIRECTORY ==="
           find /tmp/rbe-test \
