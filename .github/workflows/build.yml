@@ -1,1533 +1,409 @@
-name: LineageOS 22.2 - BuildBuddy RBE Real Compile Test
+name: LineageOS 22.2 star2lte - v24 Clean Baseline
 
 on:
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Stage to execute: audit first, then graph, rbe-smoke, full-rom"
+        required: true
+        default: audit
+        type: choice
+        options:
+          - audit
+          - graph
+          - rbe-smoke
+          - full-rom
+      runner:
+        description: "GitHub hosted or your configured Linux self-hosted runner"
+        required: true
+        default: ubuntu-24.04
+        type: choice
+        options:
+          - ubuntu-24.04
+          - self-hosted
+      sync_jobs:
+        description: "repo sync jobs (keep low to limit disk/memory pressure)"
+        required: true
+        default: '2'
+        type: string
+      build_jobs:
+        description: "Ninja build concurrency"
+        required: true
+        default: '2'
+        type: string
+      enable_rbe:
+        description: "Use BuildBuddy for full-rom (rbe-smoke always uses it)"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: los22-star2lte-rbe-real-test
-  cancel-in-progress: true
+  group: los22-star2lte-v24-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  rbe-test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-
+  clean:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
     env:
-      BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
-
-      # Android / Soong RBE
-      USE_RBE: "1"
-      RBE_DIR: "prebuilts/remoteexecution-client/live"
-      RBE_CXX_EXEC_STRATEGY: "remote"
-
-      # reclient expects host:port here, not a Bazel-style grpcs:// URL.
-      RBE_service: "remote.buildbuddy.io:443"
-
-      # BuildBuddy authenticates with the x-buildbuddy-api-key gRPC metadata
-      # header. Disable Google ADC / per-RPC Google credentials.
-      RBE_use_application_default_credentials: "false"
-      RBE_use_rpc_credentials: "false"
-      RBE_service_no_auth: "true"
-      RBE_remote_headers: "x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_API_KEY }}"
-
-      # Keep all RBE diagnostics in one place.
-      RBE_log_dir: "/tmp/rbe-test"
-      RBE_proxy_log_dir: "/tmp/rbe-test"
-      RBE_output_dir: "/tmp/rbe-test"
-      RBE_reproxy_wait_seconds: "30"
-      RBE_v: "1"
-
-      # This workflow is a correctness / connectivity test, not a speed test.
-      NINJA_REMOTE_NUM_JOBS: "1"
-      NINJA_HIGHMEM_NUM_JOBS: "1"
+      # Work inside GITHUB_WORKSPACE on either hosted or self-hosted Linux.
+      ANDROID_BUILD_TOP: ${{ github.workspace }}/android
+      REPORT_DIR: ${{ github.workspace }}/ci-reports
+      SYNC_JOBS: ${{ inputs.sync_jobs }}
+      BUILD_JOBS: ${{ inputs.build_jobs }}
+      GIT_TERMINAL_PROMPT: '0'
+      NINJA_HIGHMEM_NUM_JOBS: '1'
+      NINJA_REMOTE_NUM_JOBS: '2'
+      RBE_DIR: prebuilts/remoteexecution-client/live
+      RBE_service: remote.buildbuddy.io:443
+      RBE_use_application_default_credentials: 'false'
+      RBE_use_rpc_credentials: 'false'
+      RBE_service_no_auth: 'true'
+      RBE_CXX_EXEC_STRATEGY: remote
+      RBE_log_dir: ${{ github.workspace }}/ci-reports/rbe
+      RBE_proxy_log_dir: ${{ github.workspace }}/ci-reports/rbe
+      RBE_output_dir: ${{ github.workspace }}/ci-reports/rbe
+      RBE_reproxy_wait_seconds: '30'
 
     steps:
-      - name: Reclaim root disk
-        shell: bash
-        run: |
-          set -e
-          sudo swapoff -a || true
-          sudo rm -f /swapfile /build-swap /mnt/swapfile || true
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL \
-            /usr/local/share/boost || true
-          sudo docker image prune -a -f >/dev/null 2>&1 || true
-
-          mkdir -p /home/runner/work/los /tmp/rbe-test
-
-          echo "=== DISK ==="
-          df -h /
-          echo "=== MEMORY ==="
-          free -h
-          echo "=== CPU ==="
-          nproc
-
-      - name: Checkout local manifest
+      - name: Checkout workflow configuration
         uses: actions/checkout@v4
         with:
-          path: repo-config
+          path: config-repo
+          persist-credentials: false
 
-      - name: Install build dependencies
-        working-directory: /home/runner/work
+      - name: Preflight - runner and disk
         shell: bash
         run: |
-          set -e
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            bc \
-            bison \
-            build-essential \
-            curl \
-            flex \
-            g++-multilib \
-            gcc-multilib \
-            git \
-            git-lfs \
-            gnupg \
-            gperf \
-            imagemagick \
-            lib32readline-dev \
-            lib32z1-dev \
-            libelf-dev \
-            liblz4-tool \
-            libsdl1.2-dev \
-            libssl-dev \
-            libxml2 \
-            libxml2-utils \
-            lzop \
-            pngcrush \
-            rsync \
-            schedtool \
-            squashfs-tools \
-            xsltproc \
-            zip \
-            zlib1g-dev \
-            python3 \
-            python-is-python3 \
-            openjdk-21-jdk-headless \
-            ninja-build
+          set -euo pipefail
+          if [ "$RUNNER_OS" != Linux ]; then
+            echo '::error::v24-clean requires Linux (x86_64).'
+            exit 1
+          fi
+          mkdir -p "$REPORT_DIR" "$REPORT_DIR/rbe" "$ANDROID_BUILD_TOP"
+          {
+            echo "date=$(date -u --iso-8601=seconds)"
+            echo "runner=$RUNNER_NAME"
+            echo "mode=${{ inputs.run_mode }}"
+            echo "arch=$(uname -m)"
+            echo "source_root=$ANDROID_BUILD_TOP"
+            echo '=== df -h ==='
+            df -h "$GITHUB_WORKSPACE" "$ANDROID_BUILD_TOP"
+            echo '=== df -i ==='
+            df -i "$GITHUB_WORKSPACE"
+            echo '=== free ==='
+            free -h
+            echo '=== CPU ==='
+            nproc
+          } | tee "$REPORT_DIR/00-preflight.txt"
 
+          case "$SYNC_JOBS:$BUILD_JOBS" in
+            *[!0-9:]*|:*|*:) echo '::error::sync_jobs/build_jobs must be positive integers'; exit 1 ;;
+          esac
+          if [ "$SYNC_JOBS" -lt 1 ] || [ "$BUILD_JOBS" -lt 1 ]; then
+            echo '::error::sync_jobs/build_jobs must be >= 1'
+            exit 1
+          fi
+
+      - name: Reclaim disposable tools - GitHub hosted runner only
+        if: ${{ inputs.runner == 'ubuntu-24.04' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only disposable preinstalled SDK/toolchain bundles are removed.
+          # This step is deliberately skipped on persistent self-hosted runners.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h "$GITHUB_WORKSPACE" | tee "$REPORT_DIR/01-disk-after-reclaim.txt"
+
+      - name: Install repo (lightweight)
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p "$HOME/bin"
-          curl -fsSL \
+          curl -fsSL --retry 3 \
             https://storage.googleapis.com/git-repo-downloads/repo \
             -o "$HOME/bin/repo"
-          chmod a+x "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/repo" version | tee "$REPORT_DIR/repo-tool-version.txt" || true
 
-      - name: Validate BuildBuddy secret
+      - name: Initialize clean manifest - NO repo dieting
         shell: bash
         run: |
-          set -e
-          if [ -z "${BUILDBUDDY_API_KEY:-}" ]; then
-            echo "::error::BUILDBUDDY_API_KEY secret is missing."
+          set -euo pipefail
+          export PATH="$HOME/bin:$PATH"
+          cd "$ANDROID_BUILD_TOP"
+          git config --global user.email 'ci@local.invalid'
+          git config --global user.name 'ROM CI'
+
+          # Partial clone minimizes Git history/object downloads; source files
+          # remain complete. Avoid --depth=1: revisions and tags may need history.
+          extra=()
+          if git lfs version >/dev/null 2>&1; then
+            extra+=(--git-lfs)
+          fi
+          repo init \
+            -u https://github.com/LineageOS/android.git \
+            -b lineage-22.2 \
+            --partial-clone --clone-filter=blob:none \
+            --no-use-superproject --no-clone-bundle \
+            "${extra[@]}" 2>&1 | tee "$REPORT_DIR/repo-init.log"
+
+          source_manifest="$GITHUB_WORKSPACE/config-repo/.repo-local-manifests/star2lte-v24-clean.xml"
+          if [ ! -s "$source_manifest" ]; then
+            echo "::error::Commit the clean manifest at .repo-local-manifests/star2lte-v24-clean.xml: $source_manifest"
             exit 1
           fi
 
-      - name: Repo init and install local manifest
-        working-directory: /home/runner/work
-        shell: bash
-        run: |
-          set -e
-
-          git config --global user.email "ci@local"
-          git config --global user.name "ci"
-          git config --global color.ui false
-
-          mkdir -p /home/runner/work/los
-          cd /home/runner/work/los
-
-          repo init \
-            --depth=1 \
-            -u https://github.com/LineageOS/android.git \
-            -b lineage-22.2
+          # Reject any leftover v1..v23 remove-project instructions early.
+          python3 - "$source_manifest" <<'PY_CHECK_MANIFEST'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          removed = root.findall('remove-project')
+          projects = root.findall('project')
+          if removed:
+              raise SystemExit(f'Clean baseline rejects {len(removed)} remove-project entries')
+          if len(projects) != 12:
+              raise SystemExit(f'Expected 13 device/vendor/kernel/HAL projects, got {len(projects)}')
+          print(f'Clean local manifest: {len(projects)} additional projects, zero removals')
+          PY_CHECK_MANIFEST
 
           mkdir -p .repo/local_manifests
-
-          MANIFEST_SRC="$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml"
-          MANIFEST_DST=".repo/local_manifests/star2lte.xml"
-
-          if [ ! -s "$MANIFEST_SRC" ]; then
-            echo "::error::Local manifest not found or empty: $MANIFEST_SRC"
+          # Prevent hidden local manifests on a persistent self-hosted checkout
+          # from silently reintroducing source dieting or duplicate projects.
+          stale=$(find .repo/local_manifests -maxdepth 1 -type f ! -name star2lte.xml -print -quit)
+          if [ -n "$stale" ]; then
+            echo "::error::Unexpected extra local manifest: $stale. Remove it from the self-hosted checkout before retrying."
             exit 1
           fi
-
-          cp "$MANIFEST_SRC" "$MANIFEST_DST"
-
-          # v19: Restore two real C/C++ providers from the LineageOS 22.2
-          # default manifest. The original star2lte.xml in Git remains intact.
-          #
-          # - platform/external/bcc supplies libbpf_bcc used by libtimeinstate
-          #   and libmemevents (runtime/system libraries; must not be stubbed).
-          # - platform/hardware/google/apf supplies the APF libraries referenced
-          #   by NetworkStack JNI tests. Restoring this small project avoids
-          #   breaking the NetworkStack test graph with partial tree pruning.
-          #
-          # Both default-manifest projects use the pinned AOSP remote revision
-          # refs/tags/android-15.0.0_r32. Let repo sync select their revisions;
-          # do not fetch main or invent a replacement cc_library.
-          python3 <<'PY_RESTORE_RUNTIME'
-          from pathlib import Path
+          cp "$source_manifest" .repo/local_manifests/star2lte.xml
+          if [ -e ci-diet/Android.bp ]; then
+            echo '::error::Found legacy ci-diet/Android.bp in persistent source checkout. Use a clean source directory.'
+            exit 1
+          fi
+          repo manifest -o "$REPORT_DIR/manifest-before-sync.xml"
+          python3 - "$REPORT_DIR/manifest-before-sync.xml" <<'PY_COUNT'
+          import sys
           import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          print('Resolved manifest project count:', len(root.findall('project')))
+          PY_COUNT
 
-          p = Path(".repo/local_manifests/star2lte.xml")
-          original = p.read_text(encoding="utf-8")
-          source = original
-          required = (
-              "platform/external/bcc",
-              "platform/hardware/google/apf",
-          )
-          root = ET.fromstring(source)
-          to_remove = [element.get("name") for element in root.findall("remove-project")]
-          for project in required:
-              if project not in to_remove:
-                  print(f"Already not removed: {project}")
-                  continue
-              line = f'<remove-project name="{project}" />'
-              if source.count(line) != 1:
-                  raise SystemExit(f"Unexpected local-manifest syntax for: {project}")
-              source = source.replace(
-                  line,
-                  f'<!-- KEEP: {project} provides real Soong C/C++ libraries needed for v19. -->',
-                  1,
-              )
-              print(f"Restored default-manifest project: {project}")
+      - name: Sync full source graph (partial Git clone)
+        shell: bash
+        timeout-minutes: 210
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/bin:$PATH"
+          cd "$ANDROID_BUILD_TOP"
+          # Do not rm -rf source projects, strip Android.bp, or add dummy modules.
+          repo sync -c -j"$SYNC_JOBS" --no-clone-bundle --fail-fast \
+            2>&1 | tee "$REPORT_DIR/repo-sync.log"
 
-          ET.fromstring(source)
-          p.write_text(source, encoding="utf-8")
-          if any(item.get("name") in required
-                 for item in ET.parse(p).getroot().findall("remove-project")):
-              raise SystemExit("BCC/APF still removed in CI manifest")
-          PY_RESTORE_RUNTIME
-
-          echo "=== LOCAL MANIFEST ==="
-          sed -n '1,260p' "$MANIFEST_DST"
-
-      - name: Repo sync
-        working-directory: /home/runner/work/los
-        timeout-minutes: 120
+      - name: Measure fully synced source and lock revisions
         shell: bash
         run: |
-          set -eo pipefail
-
-          (
-            while true; do
-              echo "=== RESOURCE SNAPSHOT ==="
-              df -h / | tail -1
-              free -h | head -2
-              sleep 30
+          set -euo pipefail
+          export PATH="$HOME/bin:$PATH"
+          cd "$ANDROID_BUILD_TOP"
+          repo manifest -r -o "$REPORT_DIR/manifest-resolved-locked.xml"
+          {
+            echo '=== SOURCE / GIT DISK USE ==='
+            df -h .
+            for p in .repo/project-objects .repo/projects \
+              prebuilts external frameworks packages hardware system \
+              vendor device kernel build out; do
+              if [ -e "$p" ]; then du -sh "$p" || true; fi
             done
-          ) &
-          MONPID=$!
-          trap 'kill "$MONPID" 2>/dev/null || true' EXIT
+            echo '=== FREE BYTES ==='
+            df -B1 --output=avail . | tail -n 1
+          } | tee "$REPORT_DIR/02-synced-disk.txt"
 
-          if ! repo sync \
-            -c \
-            --no-clone-bundle \
-            --no-tags \
-            --optimized-fetch \
-            --prune \
-            -j"$(nproc)"; then
-            echo "::warning::Parallel repo sync failed; retrying with -j4."
-            repo sync \
-              -c \
-              --no-clone-bundle \
-              --no-tags \
-              --prune \
-              -j4
-          fi
+          echo '### v24 Clean Source Audit' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Zero AOSP/Lineage repository removals' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Revision lock: manifest-resolved-locked.xml in diagnostics artifact' >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source root: $ANDROID_BUILD_TOP" >> "$GITHUB_STEP_SUMMARY"
+          df -h . >> "$GITHUB_STEP_SUMMARY"
 
-          # tools/asuite/atest is host-test tooling and depends on the removed
-          # Tradefed/loganalysis/suite_harness stack. The v3 local manifest
-          # removes it before sync; keep this fallback for runs that accidentally
-          # use an older local manifest.
-          if [ -d tools/asuite ]; then
-            echo "::warning::tools/asuite is present; removing it from the ephemeral CI tree."
-            rm -rf tools/asuite
-          fi
-
-          # development/ only contains SDK packaging, samples and developer tooling
-          # for this build. Its build-tools target depends on the intentionally
-          # removed prebuilts/module_sdk/art tree.
-          if [ -d development ]; then
-            echo "::warning::development tree is present; removing it from the ephemeral CI tree."
-            rm -rf development
-          fi
-
-          # crosvm is part of the virtual-device/AVF stack. With Virtualization
-          # and hardware/google/gfxstream removed, rutabaga_gfx otherwise keeps
-          # a dangling libgfxstream_backend dependency.
-          if [ -d external/crosvm ]; then
-            echo "::warning::external/crosvm is present; removing virtual-device VMM tree."
-            rm -rf external/crosvm
-          fi
-
-          # Keep system/authgraph runtime source, but remove its tests. The test
-          # module depends on libdiced_open_dice from a provider chain that is
-          # intentionally absent from this disk-diet CI tree.
-          if [ -d system/authgraph/tests ]; then
-            echo "::warning::Removing system/authgraph/tests from CI diet tree."
-            rm -rf system/authgraph/tests
-          fi
-
-          # DeviceDiagnostics TradeInModeTests depend on VTS helper libraries
-          # that are intentionally absent. Keep the app, prune only its tests.
-          if [ -d packages/apps/DeviceDiagnostics/TradeInModeTests ]; then
-            echo "::warning::Pruning DeviceDiagnostics TradeInModeTests."
-            rm -rf packages/apps/DeviceDiagnostics/TradeInModeTests
-          fi
-
-          # Mesa is not used by the physical Exynos/Mali star2lte target.
-          # v14 cut only Mesa's gfxstream subtree and left Vulkan WSI consumers
-          # referencing mesa_gfxstream_vulkan_entrypoints. Do not split a
-          # self-contained source tree: prune the entire virtual/swrast Mesa
-          # project in this CI diet (never create a fake Vulkan runtime module).
-          if [ -d external/mesa3d ]; then
-            echo "::warning::Pruning unused Mesa3D tree (including Vulkan WSI)."
-            rm -rf external/mesa3d
-          fi
-
-          # The complete hardware/interfaces/automotive subtree is irrelevant
-          # for star2lte and otherwise depends on packages/services/Car.
-          if [ -d hardware/interfaces/automotive ]; then
-            echo "::warning::Pruning hardware/interfaces/automotive."
-            rm -rf hardware/interfaces/automotive
-          fi
-
-          # hardware/lineage/compat is used by more than Automotive; keep it.
-          # Strip ONLY the legacy Automotive *-ndk_platform compatibility
-          # libraries. Their AIDL providers were intentionally removed with
-          # hardware/interfaces/automotive for physical star2lte builds.
-          COMPAT_BP="hardware/lineage/compat/Android.bp"
-          if [ ! -f "$COMPAT_BP" ]; then
-            echo "::error::Missing Lineage compatibility file: $COMPAT_BP"
-            exit 1
-          fi
-          python3 <<'PY_COMPAT'
-          from pathlib import Path
-          import re
-
-          p = Path("hardware/lineage/compat/Android.bp")
-          text = p.read_text(encoding="utf-8")
-          starts = list(re.finditer(r"(?m)^[ \t]*cc_library(?:_shared)?[ \t]*\{", text))
-          remove = []
-          for m in starts:
-              depth = 1
-              i = m.end()
-              quote = False
-              escaped = False
-              while i < len(text) and depth > 0:
-                  c = text[i]
-                  if quote:
-                      if escaped:
-                          escaped = False
-                      elif c == "\\":
-                          escaped = True
-                      elif c == '"':
-                          quote = False
-                  elif c == '"':
-                      quote = True
-                  elif c == "{":
-                      depth += 1
-                  elif c == "}":
-                      depth -= 1
-                  i += 1
-              if depth != 0:
-                  raise SystemExit("Unbalanced Soong module in hardware/lineage/compat/Android.bp")
-              block = text[m.start():i]
-              match = re.search(
-                  r'(?m)^[ \t]*name:[ \t]*"(android\.hardware\.automotive\.[^"\n]+-ndk_platform)"',
-                  block,
-              )
-              if match:
-                  remove.append((m.start(), i, match.group(1)))
-
-          if not remove:
-              if 'android.hardware.automotive.occupant_awareness-V1-ndk_platform' in text:
-                  raise SystemExit("Automotive compatibility module found but cannot safely parse its declaration")
-              print("No Automotive NDK-platform compatibility modules remain; skipping.")
-          else:
-              for a, b, name in reversed(remove):
-                  text = text[:a] + text[b:]
-                  print("CI diet pruned compatibility module:", name)
-              p.write_text(text, encoding="utf-8")
-          PY_COMPAT
-
-          # Fail if an Automotive *-ndk_platform library remains as a module.
-          if grep -Eq 'name:[[:space:]]*"android\.hardware\.automotive\.[^"]+-ndk_platform"' "$COMPAT_BP"; then
-            echo "::error::Automotive legacy compat modules still remain."
-            exit 1
-          fi
-
-          # These two build/make utilities are telemetry/editor monitoring tools.
-          # Their only missing provider here is asuite_cc_client from the dieted
-          # Asuite tree; they are not required to produce the ROM.
-          if [ -d build/make/tools/edit_monitor ]; then
-            echo "::warning::Pruning build edit_monitor telemetry tool."
-            rm -rf build/make/tools/edit_monitor
-          fi
-          if [ -d build/make/tools/tool_event_logger ]; then
-            echo "::warning::Pruning build tool_event_logger telemetry tool."
-            rm -rf build/make/tools/tool_event_logger
-          fi
-
-          # ===== CI diet: MTS / Secretkeeper VTS-only consumers =====
-          #
-          # The optional libnativehelper MTS JNI test depends on
-          # libnativetesthelper_jni, which is not present in the dieted tree.
-          # This directory only contains MTS tests, not libnativehelper runtime.
-          if [ -d libnativehelper/tests_mts ]; then
-            echo "::notice::Pruning libnativehelper MTS test tree (libnativetesthelper_jni)."
-            rm -rf libnativehelper/tests_mts
-          fi
-
-          # Secretkeeper VTS pulls libdiced_open_dice and libsecretkeeper_client
-          # from the omitted Trusty/Virtualization/Secretkeeper stack.
-          # Keep the AIDL interface itself at .../aidl/; remove only the VTS
-          # subtree, which also contains a test CLI not selected for star2lte.
-          if [ -d hardware/interfaces/security/secretkeeper/aidl/vts ]; then
-            echo "::notice::Pruning Secretkeeper VTS test subtree (DICE dependencies)."
-            rm -rf hardware/interfaces/security/secretkeeper/aidl/vts
-          fi
-
-          # v21: VtsHalHidlTestUtils is provided by the removed VTS test stack.
-          # v20 pruned only hardware/interfaces/**/vts, but additional test-only
-          # consumers remain under frameworks/hardware, frameworks/av and
-          # system/hardware. Keep all HAL/framework/system runtime source; prune
-          # ONLY directories whose basename is exactly "vts" in these scopes.
-          echo "=== PRUNE ALL REMAINING SCOPED VTS TESTS ==="
-          VTS_TEST_SCOPES=(
-            hardware/interfaces
-            frameworks/hardware/interfaces
-            frameworks/av
-            system/hardware/interfaces
-          )
-          vts_removed=0
-          for scope in "${VTS_TEST_SCOPES[@]}"; do
-            if [ ! -d "$scope" ]; then
-              echo "::warning::VTS prune scope absent: $scope"
-              continue
-            fi
-            while IFS= read -r -d '' vts_dir; do
-              echo "::notice::Removing VTS-only test directory: $vts_dir"
-              rm -rf -- "$vts_dir"
-              vts_removed=$((vts_removed + 1))
-            done < <(find "$scope" -type d -name vts -prune -print0)
-          done
-          echo "Pruned ${vts_removed} VTS test directories from scoped trees."
-
-          # v22: BufferPool 2.0 stores VTS HIDL test modules in a directory
-          # named "tests" rather than "vts". The v21 directory-name scan
-          # cannot see these test-only consumers of VtsHalHidlTestUtils.
-          # Preserve the BufferPool runtime Android.bp and implementation.
-          BUFFERPOOL_VTS_TEST_DIR="frameworks/av/media/module/bufferpool/2.0/tests"
-          BUFFERPOOL_RUNTIME_BP="frameworks/av/media/module/bufferpool/2.0/Android.bp"
-          if [ -d "$BUFFERPOOL_VTS_TEST_DIR" ]; then
-            if [ ! -f "$BUFFERPOOL_VTS_TEST_DIR/Android.bp" ] || \
-               ! grep -q 'VtsVndkHidlBufferpoolV2_0TargetSingleTest' \
-                 "$BUFFERPOOL_VTS_TEST_DIR/Android.bp"; then
-              echo "::error::Unexpected BufferPool test layout; refusing to remove this directory."
-              exit 1
-            fi
-            echo "::notice::Pruning BufferPool 2.0 VTS-only tests."
-            rm -rf -- "$BUFFERPOOL_VTS_TEST_DIR"
-          fi
-          if [ ! -f "$BUFFERPOOL_RUNTIME_BP" ]; then
-            echo "::error::BufferPool 2.0 runtime Android.bp is missing."
-            exit 1
-          fi
-
-          # libnativetesthelper_jni originates in the omitted CTS tree.
-          # libnativehelper/tests contains test modules only, separate from
-          # libnativehelper runtime and its public headers.
-          if [ -d libnativehelper/tests ]; then
-            echo "::notice::Pruning libnativehelper/tests (CTS JNI test-only dependency)."
-            rm -rf libnativehelper/tests
-          fi
-
-          # Guard the main runtime/interface source trees: these MUST remain.
-          test -f libnativehelper/Android.bp || {
-            echo "::error::Missing libnativehelper runtime Android.bp after pruning."
-            exit 1
-          }
-          test -f hardware/interfaces/security/secretkeeper/aidl/Android.bp || {
-            echo "::error::Missing Secretkeeper AIDL definition after pruning."
-            exit 1
-          }
-
-          # v19: Verify both real providers returned by repo sync. These checks
-          # run before Soong so missing projects are not misdiagnosed as RBE
-          # failures or fixed with unsafe empty C/C++ stubs.
-          if [ ! -f external/bcc/Android.bp ]; then
-            echo "::error::external/bcc/Android.bp was not synced."
-            exit 1
-          fi
-          if ! grep -Eq 'name:[[:space:]]*"libbpf_bcc"' external/bcc/Android.bp; then
-            echo "::error::Restored external/bcc does not define libbpf_bcc."
-            exit 1
-          fi
-
-          if [ ! -f hardware/google/apf/Android.bp ]; then
-            echo "::error::hardware/google/apf/Android.bp was not synced."
-            exit 1
-          fi
-          for module in libapf libapf_v7 libapfdisassembler; do
-            if ! grep -R -l -F --include='Android.bp' -- \
-              "name: \"${module}\"" hardware/google/apf >/dev/null; then
-              echo "::error::Restored hardware/google/apf is missing: $module"
-              exit 1
-            fi
-          done
-
-          echo "=== RESTORED BCC/APF PROVIDERS ==="
-          grep -n 'name: "libbpf_bcc"' external/bcc/Android.bp
-          find hardware/google/apf -name Android.bp -print
-          df -h /
-
-          # Eigen is a real dependency of TensorFlow Lite and NeuralNetworks.
-          # It must be present from the local manifest; do not replace it with a
-          # graph shim.
-          if [ ! -f external/eigen/Android.bp ]; then
-            echo "::error::external/eigen is missing. Use the v6 CI-diet manifest that keeps platform/external/eigen."
-            exit 1
-          fi
-
-          echo "=== POST-SYNC DISK ==="
-          df -h / /home/runner/work/los
-
-
-      - name: Install CI diet Soong compatibility stubs
-        working-directory: /home/runner/work/los
+      - name: Disk capacity gate (before Soong)
+        if: ${{ inputs.run_mode != 'audit' }}
         shell: bash
         run: |
           set -euo pipefail
-
-          # platform/cts is intentionally removed from the disk-diet source tree.
-          # Several runtime repositories still carry CTS/MTS test Android.bp
-          # stanzas. Soong parses those stanzas even though the test modules are
-          # not selected for a normal star2lte ROM build.
-          #
-          # Provide only the tiny defaults needed for graph resolution. These
-          # modules do not build or package CTS/MTS.
-          mkdir -p ci-diet
-
-          # ProtoLogTool is a real framework build tool and needs actual org.json
-          # classes at compile/runtime. Do NOT satisfy json/jsonlib with empty
-          # graph shims.
-          #
-          # The synced libcore tree already contains the Android org.json
-          # implementation for this exact LineageOS revision. Stage those local
-          # sources instead of downloading a CTS archive from Gitiles.
-          CTS_JSON_DIR="ci-diet/cts-json"
-          LIBCORE_JSON_DIR="libcore/json/src/main/java/org/json"
-
-          rm -rf "$CTS_JSON_DIR"
-          mkdir -p "$CTS_JSON_DIR/src/org"
-
-          if [ ! -f "$LIBCORE_JSON_DIR/JSONObject.java" ]; then
-            echo "::error::Missing local libcore org.json sources: $LIBCORE_JSON_DIR"
-            find libcore/json -maxdepth 6 -type f 2>/dev/null | head -100 || true
+          # Conservative safety thresholds, not device-specific hard requirements.
+          # If they fail, investigate disk/report or select a larger runner;
+          # never hide the failure by deleting required Soong provider repos.
+          if [ '${{ inputs.run_mode }}' = full-rom ]; then
+            required_gib=60
+          else
+            required_gib=15
+          fi
+          available_bytes=$(df -B1 --output=avail "$ANDROID_BUILD_TOP" | tail -n 1 | tr -d ' ')
+          available_gib=$((available_bytes / 1024 / 1024 / 1024))
+          echo "Available: ${available_gib} GiB; gate: ${required_gib} GiB" \
+            | tee "$REPORT_DIR/03-capacity-gate.txt"
+          if [ "$available_gib" -lt "$required_gib" ]; then
+            echo "::error::Only ${available_gib} GiB free after clean sync. Need at least ${required_gib} GiB for this mode. Use a larger runner, not fake Soong stubs."
             exit 1
           fi
 
-          cp -a "$LIBCORE_JSON_DIR" "$CTS_JSON_DIR/src/org/"
-
-          if [ ! -f "$CTS_JSON_DIR/src/org/json/JSONObject.java" ]; then
-            echo "::error::Failed to stage local org.json sources."
-            exit 1
-          fi
-
-          echo "Using org.json sources from current libcore revision."
-          echo "JSON source count: $(find "$CTS_JSON_DIR/src/org/json" -type f -name '*.java' | wc -l)"
-          find "$CTS_JSON_DIR/src/org/json" -maxdepth 1 -type f -name '*.java' -printf '%f\n' | sort
-
-          # libassemblevintf / assemble_vintf are real host build tools and
-          # depend on libvts_vintf_test_common. Restoring the whole VTS HAL repo
-          # would bring back a large test graph, so stage only the exact provider
-          # subtree from the AOSP tag used by LineageOS 22.2.
-          VTS_AOSP_TAG="android-15.0.0_r32"
-          VTS_STAGE_DIR="ci-diet/vts-vintf-common"
-          VTS_TMP_DIR="$(mktemp -d)"
-
-          rm -rf "$VTS_STAGE_DIR"
-          mkdir -p "$VTS_STAGE_DIR"
-
-          echo "Fetching minimal libvts_vintf_test_common from ${VTS_AOSP_TAG}..."
-          git clone             --depth=1             --filter=blob:none             --sparse             --branch "$VTS_AOSP_TAG"             https://android.googlesource.com/platform/test/vts-testcase/hal             "$VTS_TMP_DIR/hal"
-
-          git -C "$VTS_TMP_DIR/hal" sparse-checkout set             treble/vintf/libvts_vintf_test_common
-
-          cp -a             "$VTS_TMP_DIR/hal/treble/vintf/libvts_vintf_test_common/."             "$VTS_STAGE_DIR/"
-
-          rm -rf "$VTS_TMP_DIR"
-
-          if [ ! -f "$VTS_STAGE_DIR/Android.bp" ] ||              [ ! -f "$VTS_STAGE_DIR/common.cpp" ]; then
-            echo "::error::Failed to stage real libvts_vintf_test_common sources."
-            exit 1
-          fi
-
-          if ! grep -q 'name: "libvts_vintf_test_common"' "$VTS_STAGE_DIR/Android.bp"; then
-            echo "::error::Staged VTS VINTF provider does not define libvts_vintf_test_common."
-            cat "$VTS_STAGE_DIR/Android.bp"
-            exit 1
-          fi
-
-          # system/authgraph/tests is intentionally pruned. The remaining
-          # boringssl/core test modules still reference libauthgraph_core_test.
-          # Provide only a tiny Rust test-helper graph shim; it is not selected
-          # for the star2lte ROM.
-          mkdir -p ci-diet/authgraph-core-test
-          cat > ci-diet/authgraph-core-test/lib.rs <<'EOF_RUST'
-          #![allow(dead_code)]
-          pub fn ci_diet_placeholder() {}
-          EOF_RUST
-
-          # ===== Minimal REAL providers from platform/development =====
-          #
-          # The manifest intentionally removes the full development project
-          # because development/build pulls SDK-packaging prebuilts that are not
-          # needed for a ROM. However ADB/Fastboot/recovery need three providers:
-          #   platform_tools_version  (development/sdk)
-          #   python-symbol           (development/scripts)
-          #   adb_py                  (development/python-packages)
-          #
-          # Stage only their real source files from the exact AOSP release that
-          # matches BUILD_ID=BP1A.250505.005.
-          DEV_AOSP_TAG="android-15.0.0_r32"
-          DEV_STAGE_DIR="ci-diet/development-provider"
-          DEV_TMP_DIR="$(mktemp -d)"
-
-          rm -rf "$DEV_STAGE_DIR"
-          mkdir -p             "$DEV_STAGE_DIR/sdk"             "$DEV_STAGE_DIR/scripts"             "$DEV_STAGE_DIR/python-packages"
-
-          echo "Fetching minimal platform/development providers from ${DEV_AOSP_TAG}..."
-          git clone             --depth=1             --filter=blob:none             --sparse             --branch "$DEV_AOSP_TAG"             https://android.googlesource.com/platform/development             "$DEV_TMP_DIR/development"
-
-          # Also stage original Windows-only ADB USB libraries. Soong resolves
-          # target.windows shared_libs while generating the global graph, even
-          # though the runner builds only Linux/Android targets.
-          git -C "$DEV_TMP_DIR/development" sparse-checkout set \
-            sdk scripts python-packages host/windows
-
-          cp             "$DEV_TMP_DIR/development/sdk/plat_tools_source.prop_template"             "$DEV_STAGE_DIR/sdk/"
-
-          cp             "$DEV_TMP_DIR/development/scripts/symbol.py"             "$DEV_STAGE_DIR/scripts/"
-
-          mkdir -p "$DEV_STAGE_DIR/python-packages/adb"
-          cp -a             "$DEV_TMP_DIR/development/python-packages/adb/."             "$DEV_STAGE_DIR/python-packages/adb/"
-
-          # Copy upstream Android.bp + real Windows DLL/import library + headers.
-          # No fake cc_* library and no duplicate name in ci-diet/Android.bp.
-          mkdir -p "$DEV_STAGE_DIR/host"
-          cp -a "$DEV_TMP_DIR/development/host/windows" "$DEV_STAGE_DIR/host/"
-
-          rm -rf "$DEV_TMP_DIR"
-
-          if [ ! -f "$DEV_STAGE_DIR/sdk/plat_tools_source.prop_template" ]; then
-            echo "::error::Missing staged platform_tools_version input."
-            exit 1
-          fi
-          if [ ! -f "$DEV_STAGE_DIR/scripts/symbol.py" ]; then
-            echo "::error::Missing staged python-symbol source."
-            exit 1
-          fi
-          if ! find "$DEV_STAGE_DIR/python-packages/adb" -type f -name '*.py' -print -quit | grep -q .; then
-            echo "::error::Missing staged adb_py sources."
-            exit 1
-          fi
-
-          WIN_ADB_DIR="$DEV_STAGE_DIR/host/windows"
-          WIN_ADB_BP="$WIN_ADB_DIR/Android.bp"
-          # These files must be real prebuilt assets from the selected AOSP tag.
-          for required_file in \
-            "$WIN_ADB_BP" \
-            "$WIN_ADB_DIR/prebuilt/usb/AdbWinApi.dll" \
-            "$WIN_ADB_DIR/prebuilt/usb/AdbWinApi.lib" \
-            "$WIN_ADB_DIR/prebuilt/usb/AdbWinUsbApi.dll" \
-            "$WIN_ADB_DIR/usb/api/adb_api.h"
-          do
-            if [ ! -f "$required_file" ]; then
-              echo "::error::Missing original Windows ADB provider file: $required_file"
-              exit 1
-            fi
-          done
-
-          for win_module in AdbWinApi AdbWinUsbApi; do
-            if ! grep -Eq "name:[[:space:]]*\"${win_module}\"" "$WIN_ADB_BP"; then
-              echo "::error::Upstream Windows ADB provider missing: ${win_module}"
-              exit 1
-            fi
-          done
-          echo "Original Windows ADB providers staged: $WIN_ADB_BP"
-          echo "Minimal development providers staged successfully."
-
-          # libflagtest is a REAL C++ test helper from platform_testing.
-          # Bluetooth's many cc_test modules refer to it even when the ROM
-          # doesn't build those tests; restore only its source and headers.
-          # Copy files explicitly: do not copy upstream Android.bp or register
-          # any extra test modules that might create further dangling edges.
-          FLAGTEST_TAG="android-15.0.0_r32"
-          FLAGTEST_TMP="$(mktemp -d)"
-          FLAGTEST_SRC="ci-diet/flagtest"
-          trap 'rm -rf "$FLAGTEST_TMP"' EXIT
-          git clone --depth=1 --filter=blob:none --sparse \
-            --branch "$FLAGTEST_TAG" \
-            https://android.googlesource.com/platform/platform_testing \
-            "$FLAGTEST_TMP/platform_testing"
-          git -C "$FLAGTEST_TMP/platform_testing" sparse-checkout set \
-            libraries/flag-helpers/libflagtest
-          SRC_FLAGTEST="$FLAGTEST_TMP/platform_testing/libraries/flag-helpers/libflagtest"
-          test -f "$SRC_FLAGTEST/flag_checker.cpp"
-          test -f "$SRC_FLAGTEST/include/flag_checker.h"
-          test -f "$SRC_FLAGTEST/include/flag_macros.h"
-          mkdir -p "$FLAGTEST_SRC"
-          cp "$SRC_FLAGTEST/flag_checker.cpp" "$FLAGTEST_SRC/"
-          cp -a "$SRC_FLAGTEST/include" "$FLAGTEST_SRC/"
-          rm -rf "$FLAGTEST_TMP"
-          trap - EXIT
-          echo "Real libflagtest source staged from ${FLAGTEST_TAG}."
-
-          # v22: aconfigd/libaconfigd genuinely depends on the generated
-          # CTS flag C++ implementation. Recreate only the three upstream flag
-          # declarations from platform/cts/flags/tests/aconfig, not an empty
-          # cc_library shim. Do not change the aconfigd runtime Android.bp.
-          mkdir -p ci-diet/cts-flags
-          cat > ci-diet/cts-flags/android.cts.flags.tests.aconfig <<'EOF_CTS_FLAGS'
-          // Minimal CTS flag declarations for the LineageOS CI-diet build.
-          // Matches the flag package/names used by platform/cts.
-          package: "android.cts.flags.tests"
-          container: "system"
-          flag {
-            name: "readwrite_disabled_flag"
-            namespace: "cts"
-            description: "testing flag that is always disabled"
-            bug: "<none>"
-          }
-          flag {
-            name: "readwrite_disabled_flag_2"
-            namespace: "cts"
-            description: "another testing flag that is always disabled"
-            bug: "<none>"
-          }
-          flag {
-            name: "readwrite_enabled_flag"
-            namespace: "cts"
-            description: "testing flag that is always enabled"
-            bug: "<none>"
-          }
-          EOF_CTS_FLAGS
-          test -s ci-diet/cts-flags/android.cts.flags.tests.aconfig
-
-          cat > ci-diet/Android.bp <<'EOF'
-          // CI-only compatibility stubs for the disk-diet star2lte source tree.
-          //
-          // platform/cts is intentionally not synced on the GitHub runner.
-          // Some runtime source repositories still contain CTS/MTS test modules
-          // in Android.bp files. Soong parses them even when they are never
-          // selected for the ROM.
-          //
-          // Keep these definitions minimal: they only satisfy graph resolution.
-
-          package {
-              default_visibility: ["//visibility:public"],
-          }
-
-          java_defaults {
-              name: "cts_error_prone_rules",
-          }
-
-          java_defaults {
-              name: "cts_error_prone_rules_tests",
-          }
-
-          java_defaults {
-              name: "cts_support_defaults",
-              defaults: ["cts_error_prone_rules_tests"],
-              dex_preopt: {
-                  enabled: false,
-              },
-              optimize: {
-                  enabled: false,
-              },
-          }
-
-          java_defaults {
-              name: "cts_defaults",
-              defaults: ["cts_support_defaults"],
-          }
-
-          java_defaults {
-              name: "mts-target-sdk-version-current",
-              target_sdk_version: "10000",
-          }
-
-          // ===== Removed Automotive / Car providers =====
-
-          cc_defaults {
-              name: "vhalclient_defaults",
-          }
-
-          cc_defaults {
-              name: "android-automotive-large-parcelable-defaults",
-          }
-
-          cc_defaults {
-              name: "powerpolicyclient_defaults",
-          }
-
-          // ===== Removed AVF / Virtualization provider =====
-          //
-          // Only Microdroid/AVF variants currently reference this in the
-          // disk-diet graph. star2lte does not select those variants.
-
-          cc_defaults {
-              name: "avf_build_flags_cc",
-          }
-
-          // ===== Removed Tradefed provider =====
-
-          java_defaults {
-              name: "tradefed_errorprone_defaults",
-          }
-
-          // ===== Removed platform_testing providers =====
-
-          rust_defaults {
-              name: "rdroidtest.defaults",
-          }
-
-          // MotionTestDefaults is consumed only by SystemUI motion-test modules
-          // in this tree. A plain java_defaults shim is sufficient for Soong
-          // graph resolution because the tests are not selected for the ROM.
-          java_defaults {
-              name: "MotionTestDefaults",
-          }
-
-          // ===== Removed Tradefed / CTS / suite_harness host libraries =====
-          //
-          // These modules are referenced only by host-test/tooling stanzas that
-          // Soong still parses inside runtime repositories. They are deliberately
-          // empty because those tests/tools are not selected for the star2lte ROM.
-
-          java_library_host {
-              name: "tradefed",
-          }
-
-          java_library_host {
-              name: "compatibility-host-util",
-          }
-
-          java_library_host {
-              name: "cts-tradefed",
-          }
-
-          java_library_host {
-              name: "cts-install-lib-host",
-          }
-
-          java_library_host {
-              name: "loganalysis",
-          }
-
-          // ===== Optional AWS KMS dependencies removed from the diet tree =====
-          //
-          // tools/apksig keeps optional AWS KMS provider modules in its Android.bp.
-          // Normal Android ROM signing does not require these libraries.
-
-          java_library_host {
-              name: "awssdk-kms",
-          }
-
-          java_library_host {
-              name: "awssdk-url-connection-client",
-          }
-
-          // ===== Removed suite_harness host library =====
-          java_library_host {
-              name: "compatibility-tradefed",
-          }
-
-          // ===== CTS json / vogar host providers removed with platform/cts =====
-          // libcore/tools/non-cts-json-generator is host-side non-CTS tooling.
-          // Match the upstream provider module kinds so Soong can resolve graph.
-
-          // ===== Real CTS JSON provider needed by framework ProtoLogTool =====
-          //
-          // Unlike most entries in this file, json/jsonlib are NOT empty graph
-          // shims. frameworks/base/tools/protologtool is a real host build tool
-          // and must compile/run against actual org.json classes.
-
-          java_library {
-              name: "json",
-              host_supported: true,
-              srcs: ["cts-json/src/**/*.java"],
-              sdk_version: "current",
-              java_version: "11",
-          }
-
-          java_library_host {
-              name: "jsonlib",
-              static_libs: ["json"],
-          }
-
-          java_library_host {
-              name: "vogarexpectlib",
-          }
-
-          // ===== Remaining CTS / platform_testing graph providers =====
-
-          // Upstream platform/cts/tools/cts-tradefed.
-          java_library_host {
-              name: "cts-tradefed-harness",
-          }
-
-          // Upstream platform_testing/libraries/annotations.
-          // This dependency is currently reached by test/input modules such as
-          // lockedregioncodeinjection_input; those are not selected for the ROM.
-          java_library_static {
-              name: "platform-test-annotations",
-              host_supported: true,
-          }
-
-          // ===== Remaining CTS / platform_testing host-test providers =====
-          //
-          // These are referenced only by host-test modules that Soong parses.
-          // They are not selected for the star2lte ROM, so empty host providers
-          // are sufficient for graph resolution.
-
-          java_library_host {
-              name: "cts-shim-host-lib",
-          }
-
-          // v20: platform_testing/libraries/flag-helpers/junit normally defines
-          // this *device* java_library. It is referenced by Ravenwood/test
-          // build-graph modules, which are not included in star2lte product.
-          // This shim is for Soong graph resolution only, not for running tests.
-          java_library {
-              name: "flag-junit",
-              sdk_version: "module_current",
-          }
-
-          java_library_host {
-              name: "flag-junit-host",
-          }
-
-          java_library_host {
-              name: "cts-statsd-atom-host-test-utils",
-          }
-
-          java_library_host {
-              name: "cts-host-utils",
-          }
-
-          java_library_host {
-              name: "compatibility-host-util-axt",
-          }
-
-          // ===== REAL platform/development providers =====
-          //
-          // These use upstream source files staged from android-15.0.0_r32.
-          // They are not empty graph shims.
-
-          genrule {
-              name: "platform_tools_version",
-              cmd: "sed 's/$${PLATFORM_SDK_VERSION}/0/ ; s/^Pkg.Revision=\\(.*\\)/#define PLATFORM_TOOLS_VERSION \"\\1\"/p ; d' $(in) > $(out)",
-              srcs: ["development-provider/sdk/plat_tools_source.prop_template"],
-              out: ["platform_tools_version.h"],
-          }
-
-          python_library_host {
-              name: "python-symbol",
-              srcs: ["development-provider/scripts/symbol.py"],
-          }
-
-          // adb_py is NOT declared here: the staged upstream file
-          // development-provider/python-packages/adb/Android.bp already
-          // declares it. Keep that original module to avoid duplicate names.
-
-          // ===== Real generated CTS flag provider used by aconfigd =====
-          // platform/cts is intentionally absent. Its original provider is a
-          // cc_aconfig_library, generated from aconfig declarations; do not
-          // replace it with a stub cc_library or remove it from libaconfigd.
-          aconfig_declarations {
-              name: "cts_flags_tests",
-              package: "android.cts.flags.tests",
-              container: "system",
-              srcs: ["cts-flags/android.cts.flags.tests.aconfig"],
-          }
-
-          cc_aconfig_library {
-              name: "cts_flags_tests_cc",
-              aconfig_declarations: "cts_flags_tests",
-          }
-
-          // ===== Real libflagtest from platform_testing (test-only) =====
-          // Bluetooth and framework cc_test modules need both its symbols and
-          // the public flag_macros.h header. These are genuine upstream sources,
-          // not an empty test shim.
-          cc_library_static {
-              name: "libflagtest",
-              srcs: ["flagtest/flag_checker.cpp"],
-              export_include_dirs: ["flagtest/include"],
-              host_supported: true,
-              vendor_available: true,
-              product_available: true,
-              native_bridge_supported: true,
-              static_libs: ["libgtest"],
-              shared_libs: ["libbase"],
-          }
-
-          // ===== AuthGraph test helper removed with system/authgraph/tests =====
-          //
-          // This is test-only. The real AuthGraph runtime libraries remain in
-          // system/authgraph. Both Android and host variants are provided so
-          // unselected rust_test modules can resolve their graph.
-
-          rust_library {
-              name: "libauthgraph_core_test",
-              crate_name: "authgraph_core_test",
-              srcs: ["authgraph-core-test/lib.rs"],
-              host_supported: true,
-          }
-          EOF
-
-          echo "=== CI DIET SOONG STUBS ==="
-          sed -n '1,220p' ci-diet/Android.bp
-
-          test -s ci-diet/Android.bp
-
-          # adb_py is defined in the upstream Android.bp staged in v14.
-          # Do not declare it again in the top-level CI-diet Android.bp.
-          ADB_BP="ci-diet/development-provider/python-packages/adb/Android.bp"
-          if [ ! -f "$ADB_BP" ] || ! grep -Eq 'name:[[:space:]]*"adb_py"' "$ADB_BP"; then
-            echo "::error::Missing original adb_py provider in $ADB_BP"
-            exit 1
-          fi
-          if grep -Eq 'name:[[:space:]]*"adb_py"' ci-diet/Android.bp; then
-            echo "::error::Duplicate adb_py declaration in ci-diet/Android.bp"
-            exit 1
-          fi
-          echo "Using upstream adb_py provider: $ADB_BP"
-
-          # Windows-only shared modules must come from the staged upstream BP.
-          WIN_ADB_BP="ci-diet/development-provider/host/windows/Android.bp"
-          if [ ! -f "$WIN_ADB_BP" ]; then
-            echo "::error::Missing original Windows ADB Android.bp"
-            exit 1
-          fi
-          for module in AdbWinApi AdbWinUsbApi; do
-            if ! grep -Eq "name:[[:space:]]*\"${module}\"" "$WIN_ADB_BP"; then
-              echo "::error::Missing upstream Windows ADB Soong module: $module"
-              exit 1
-            fi
-            if grep -Eq "name:[[:space:]]*\"${module}\"" ci-diet/Android.bp; then
-              echo "::error::Duplicate Windows ADB module in ci-diet/Android.bp: $module"
-              exit 1
-            fi
-          done
-          echo "Using upstream Windows-only ADB providers: $WIN_ADB_BP"
-
-          for module in \
-            cts_error_prone_rules \
-            cts_error_prone_rules_tests \
-            cts_support_defaults \
-            cts_defaults \
-            mts-target-sdk-version-current \
-            vhalclient_defaults \
-            android-automotive-large-parcelable-defaults \
-            powerpolicyclient_defaults \
-            avf_build_flags_cc \
-            tradefed_errorprone_defaults \
-            rdroidtest.defaults \
-            MotionTestDefaults \
-            tradefed \
-            compatibility-host-util \
-            cts-tradefed \
-            cts-install-lib-host \
-            loganalysis \
-            awssdk-kms \
-            awssdk-url-connection-client \
-            compatibility-tradefed \
-            json \
-            vogarexpectlib \
-            jsonlib \
-            cts-tradefed-harness \
-            platform-test-annotations \
-            cts-shim-host-lib \
-            flag-junit \
-            flag-junit-host \
-            cts-statsd-atom-host-test-utils \
-            cts-host-utils \
-            compatibility-host-util-axt \
-            platform_tools_version \
-            python-symbol \
-            libflagtest \
-            libauthgraph_core_test
-          do
-            if ! grep -q "name: \"${module}\"" ci-diet/Android.bp; then
-              echo "::error::Missing CI diet Soong stub: ${module}"
-              exit 1
-            fi
-          done
-
-          # The real CTS project must stay absent; otherwise these names would
-          # collide with the genuine platform/cts definitions.
-          if [ -d cts ]; then
-            echo "::error::platform/cts is present while CI stubs are enabled."
-            exit 1
-          fi
-
-          if [ -d tools/asuite ]; then
-            echo "::error::tools/asuite is still present in the CI diet tree."
-            exit 1
-          fi
-
-          if [ -d development ]; then
-            echo "::error::development is still present in the CI diet tree."
-            exit 1
-          fi
-
-          if [ -d external/crosvm ]; then
-            echo "::error::external/crosvm is still present in the CI diet tree."
-            exit 1
-          fi
-
-          if [ -d system/authgraph/tests ]; then
-            echo "::error::system/authgraph/tests is still present in the CI diet tree."
-            exit 1
-          fi
-
-          # MTS/VTS modules must not be rediscovered during Soong graph creation.
-          for removed_test_path in \
-            libnativehelper/tests_mts \
-            libnativehelper/tests \
-            hardware/interfaces/security/secretkeeper/aidl/vts
-          do
-            if [ -e "$removed_test_path" ]; then
-              echo "::error::CI-only test subtree was not pruned: $removed_test_path"
-              exit 1
-            fi
-          done
-
-          # v21: Ensure Soong cannot rediscover VtsHalHidlTestUtils consumers
-          # from any of the four explicitly scoped VTS-only test trees.
-          for scope in \
-            hardware/interfaces \
-            frameworks/hardware/interfaces \
-            frameworks/av \
-            system/hardware/interfaces
-          do
-            if [ -d "$scope" ] && \
-               find "$scope" -type d -name vts -print -quit | grep -q .; then
-              echo "::error::VTS test directories remain under: $scope"
-              find "$scope" -type d -name vts -prune -print | head -30
-              exit 1
-            fi
-          done
-
-          # v22: verify the additional BufferPool VTS-only test subtree was
-          # removed while its sibling runtime Android.bp remains untouched.
-          if [ -e frameworks/av/media/module/bufferpool/2.0/tests ]; then
-            echo "::error::BufferPool 2.0 VTS test subtree still exists."
-            exit 1
-          fi
-          test -f frameworks/av/media/module/bufferpool/2.0/Android.bp
-
-          # v22: fail before Soong if the *real* CTS AConfig provider is missing.
-          test -s ci-diet/cts-flags/android.cts.flags.tests.aconfig
-          grep -q 'name: "cts_flags_tests_cc"' ci-diet/Android.bp
-          grep -q 'aconfig_declarations: "cts_flags_tests"' ci-diet/Android.bp
-          if grep -R -l --include='Android.bp' 'name: "cts_flags_tests_cc"' cts 2>/dev/null; then
-            echo "::error::Unexpected duplicate CTS flags provider in cts/."
-            exit 1
-          fi
-
-          for removed_path in             packages/apps/DeviceDiagnostics/TradeInModeTests             external/mesa3d             hardware/interfaces/automotive             build/make/tools/edit_monitor             build/make/tools/tool_event_logger
-          do
-            if [ -e "$removed_path" ]; then
-              echo "::error::CI diet path still exists: $removed_path"
-              exit 1
-            fi
-          done
-
-          if ! grep -q 'srcs: \["cts-json/src/\*\*/\*.java"\]' ci-diet/Android.bp; then
-            echo "::error::json provider is not backed by staged local org.json sources."
-            exit 1
-          fi
-
-          if [ ! -f ci-diet/flagtest/flag_checker.cpp ] || \
-             [ ! -f ci-diet/flagtest/include/flag_macros.h ]; then
-            echo "::error::Real libflagtest sources missing before Soong."
-            exit 1
-          fi
-
-          if ! grep -q 'name: "jsonlib"' ci-diet/Android.bp; then
-            echo "::error::jsonlib provider is missing."
-            exit 1
-          fi
-
-          echo "CI diet Soong compatibility stubs installed successfully."
-
-
-      - name: Patch CI diet virtualization fuzzer binding
-        working-directory: /home/runner/work/los
+      - name: Install Android build prerequisites
+        if: ${{ inputs.run_mode != 'audit' }}
         shell: bash
         run: |
           set -euo pipefail
-
-          # packages/modules/Virtualization is intentionally removed from this
-          # disk-diet source tree. system/sepolicy still references
-          # virtualizationmanager_fuzzer for android.system.virtualizationservice.
-          #
-          # The Go map aligns values using variable whitespace, so use a
-          # whitespace-tolerant regex instead of an exact formatted line.
-          if [ -d packages/modules/Virtualization ]; then
-            echo "Virtualization tree is present; keeping upstream fuzzer binding."
+          # Target environment: Ubuntu 24.04 Linux. Do not reinstall on
+          # self-hosted runners with their own provisioned toolchain.
+          if [ '${{ inputs.runner }}' = self-hosted ]; then
+            echo 'Using preinstalled build dependencies on self-hosted runner.'
+            for tool in python3 gcc g++ javac zip; do
+              command -v "$tool" >/dev/null || {
+                echo "::error::Missing self-hosted prerequisite: $tool"
+                exit 1
+              }
+            done
             exit 0
           fi
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential flex gperf imagemagick \
+            lib32z1-dev libc6-dev-i386 libelf-dev liblz4-tool \
+            libncurses-dev libssl-dev libxml2-utils lzop \
+            pngcrush python3 python-is-python3 rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev \
+            openjdk-21-jdk-headless
+          java -version
 
-          BINDINGS="system/sepolicy/build/soong/service_fuzzer_bindings.go"
-
-          if [ ! -f "$BINDINGS" ]; then
-            echo "::error::Missing expected sepolicy binding file: $BINDINGS"
-            exit 1
-          fi
-
-          echo "=== BEFORE PATCH ==="
-          grep -n -E 'android\.system\.virtualizationservice|virtualizationmanager_fuzzer' "$BINDINGS" || true
-
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-
-          p = Path("system/sepolicy/build/soong/service_fuzzer_bindings.go")
-          s = p.read_text(encoding="utf-8")
-
-          already = re.search(
-              r'(?m)^\s*"android\.system\.virtualizationservice"\s*:\s*EXCEPTION_NO_FUZZER\s*,\s*$',
-              s,
-          )
-          if already:
-              print("virtualizationservice is already EXCEPTION_NO_FUZZER.")
-              raise SystemExit(0)
-
-          pattern = re.compile(
-              r'(?m)^(\s*"android\.system\.virtualizationservice"\s*:\s*)'
-              r'\[\]string\s*\{\s*"virtualizationmanager_fuzzer"\s*\}\s*,\s*$'
-          )
-
-          patched, count = pattern.subn(r'\1EXCEPTION_NO_FUZZER,', s, count=1)
-
-          if count != 1:
-              print("Could not match the virtualizationservice fuzzer binding.")
-              print("Relevant source lines:")
-              for i, line in enumerate(s.splitlines(), 1):
-                  if "android.system.virtualizationservice" in line or "virtualizationmanager_fuzzer" in line:
-                      print(f"{i}: {line}")
-              raise SystemExit(1)
-
-          p.write_text(patched, encoding="utf-8")
-          print("Patched virtualizationservice fuzzer binding for CI diet.")
-          PY
-
-          echo "=== AFTER PATCH ==="
-          grep -n -E 'android\.system\.virtualizationservice|virtualizationmanager_fuzzer' "$BINDINGS" || true
-
-          if ! grep -Eq '"android\.system\.virtualizationservice"[[:space:]]*:[[:space:]]*EXCEPTION_NO_FUZZER' "$BINDINGS"; then
-            echo "::error::CI diet virtualization fuzzer patch verification failed."
-            exit 1
-          fi
-
-          echo "Virtualization fuzzer binding patch verified."
-      - name: Verify star2lte product registration
-        working-directory: /home/runner/work/los
+      - name: Generate native Soong graph (RBE OFF)
+        if: ${{ inputs.run_mode == 'graph' || inputs.run_mode == 'rbe-smoke' || inputs.run_mode == 'full-rom' }}
         shell: bash
+        timeout-minutes: 75
+        env:
+          USE_RBE: '0'
         run: |
-          set -eo pipefail
-
-          echo "=== PRODUCT REGISTRATION ==="
-
-          MATCHES="$(
-            grep -R -l \
-              --include='AndroidProducts.mk' \
-              'lineage_star2lte' \
-              device vendor 2>/dev/null | head -20 || true
-          )"
-
-          if [ -z "$MATCHES" ]; then
-            echo "::error::Could not find lineage_star2lte in any AndroidProducts.mk."
-            echo "The local manifest did not sync/register the star2lte product correctly."
-            find device vendor -maxdepth 4 -name AndroidProducts.mk -print 2>/dev/null | head -100 || true
-            exit 1
-          fi
-
-          printf '%s\n' "$MATCHES"
-
-          while IFS= read -r file; do
-            [ -n "$file" ] || continue
-            echo "--- $file"
-            sed -n '1,180p' "$file"
-          done <<< "$MATCHES"
-
-      - name: Inspect Android reclient
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -e
-
-          echo "=== RECLIENT DIRECTORY ==="
-          ls -lah "$RBE_DIR"
-
-          test -x "$RBE_DIR/reproxy"
-          test -x "$RBE_DIR/rewrapper"
-          test -x "$RBE_DIR/bootstrap"
-
-          echo "=== REPROXY VERSION ==="
-          "$RBE_DIR/reproxy" --version || true
-
-          echo "=== REWRAPPER VERSION ==="
-          "$RBE_DIR/rewrapper" --version || true
-
-          echo "=== BOOTSTRAP VERSION ==="
-          "$RBE_DIR/bootstrap" --version || true
-
-      - name: Check BuildBuddy network connectivity
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -e
-
-          echo "=== DNS ==="
-          getent hosts remote.buildbuddy.io
-
-          echo "=== TCP 443 ==="
-          timeout 15 bash -c 'cat < /dev/null > /dev/tcp/remote.buildbuddy.io/443'
-
-          echo "BuildBuddy TCP endpoint is reachable."
-          echo "Authentication will be validated by the real reclient compile below."
-
-      - name: Configure Lineage and run real RBE C++ compile
-        working-directory: /home/runner/work/los
-        timeout-minutes: 45
-        shell: bash
-        run: |
-          set -eo pipefail
-
-          mkdir -p /tmp/rbe-test
-
-          # Lineage's breakfast helper reads the correct target release from
-          # vendor/lineage/vars/aosp_target_release and expands star2lte to
-          # lineage_star2lte-<release>-userdebug.
+          set -euo pipefail
+          cd "$ANDROID_BUILD_TOP"
           source build/envsetup.sh
-          source vendor/lineage/vars/aosp_target_release
-
-          EXPECTED_RELEASE="${aosp_target_release}"
           breakfast star2lte userdebug
+          echo "TARGET_PRODUCT=$TARGET_PRODUCT" | tee "$REPORT_DIR/product-selection.txt"
+          echo "TARGET_RELEASE=$TARGET_RELEASE" | tee -a "$REPORT_DIR/product-selection.txt"
+          echo "TARGET_BUILD_VARIANT=$TARGET_BUILD_VARIANT" | tee -a "$REPORT_DIR/product-selection.txt"
+          test "$TARGET_PRODUCT" = lineage_star2lte
+          test "$TARGET_RELEASE" = bp1a
+          echo '=== CLEAN M NOTHING (NO RBE) ==='
+          m nothing 2>&1 | tee "$REPORT_DIR/m-nothing.log"
+          test -s out/soong/build.lineage_star2lte.ninja
+          echo 'CLEAN_GRAPH_PASS=1' | tee "$REPORT_DIR/graph-result.txt"
 
-          echo "=== LINEAGE BUILD SELECTION ==="
-          echo "ANDROID_BUILD_TOP=${ANDROID_BUILD_TOP:-unset}"
-          echo "TARGET_PRODUCT=${TARGET_PRODUCT:-unset}"
-          echo "TARGET_RELEASE=${TARGET_RELEASE:-unset}"
-          echo "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-unset}"
-          echo "TARGET_BUILD_TYPE=${TARGET_BUILD_TYPE:-unset}"
-          echo "EXPECTED_RELEASE=${EXPECTED_RELEASE}"
-
-          test -n "${ANDROID_BUILD_TOP:-}"
-          test "${TARGET_PRODUCT}" = "lineage_star2lte"
-          test "${TARGET_RELEASE}" = "${EXPECTED_RELEASE}"
-          test "${TARGET_BUILD_VARIANT}" = "userdebug"
-
-          if [ "$(cd "$ANDROID_BUILD_TOP" && pwd -P)" != "$(pwd -P)" ]; then
-            echo "::error::ANDROID_BUILD_TOP does not point at the current source tree."
+      - name: Check BuildBuddy secret (only for remote mode)
+        if: ${{ inputs.run_mode == 'rbe-smoke' || (inputs.run_mode == 'full-rom' && inputs.enable_rbe) }}
+        shell: bash
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUILDBUDDY_API_KEY" ]; then
+            echo '::error::Missing BUILDBUDDY_API_KEY secret.'
             exit 1
           fi
+          echo 'BuildBuddy API key is configured (value never printed).'
 
-          echo "=== EFFECTIVE RBE CONFIG ==="
-          {
-            echo "USE_RBE=${USE_RBE}"
-            echo "RBE_service=${RBE_service}"
-            echo "RBE_DIR=${RBE_DIR}"
-            echo "RBE_CXX_EXEC_STRATEGY=${RBE_CXX_EXEC_STRATEGY}"
-            echo "RBE_use_application_default_credentials=${RBE_use_application_default_credentials}"
-            echo "RBE_use_rpc_credentials=${RBE_use_rpc_credentials}"
-            echo "RBE_service_no_auth=${RBE_service_no_auth}"
-            echo "RBE_remote_headers=x-buildbuddy-api-key=<redacted>"
-            echo "RBE_log_dir=${RBE_log_dir}"
-            echo "RBE_proxy_log_dir=${RBE_proxy_log_dir}"
-            echo "RBE_output_dir=${RBE_output_dir}"
-            echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
-          } | tee /tmp/rbe-test/rbe-env.txt
-
-          echo "=== VERIFY CI DIET PATCHES BEFORE SOONG ==="
-          BINDINGS="$ANDROID_BUILD_TOP/system/sepolicy/build/soong/service_fuzzer_bindings.go"
-
-          if [ ! -d "$ANDROID_BUILD_TOP/packages/modules/Virtualization" ]; then
-            if grep -q 'virtualizationmanager_fuzzer' "$BINDINGS"; then
-              echo "::error::virtualizationmanager_fuzzer binding is still active while Virtualization is absent."
-              grep -n -E 'android\.system\.virtualizationservice|virtualizationmanager_fuzzer' "$BINDINGS" || true
-              exit 1
-            fi
-
-            if grep -q 'android.system.virtualizationservice' "$BINDINGS"; then
-              echo "Virtualization service binding after CI diet patch:"
-              grep -n 'android.system.virtualizationservice' "$BINDINGS" || true
-            else
-              echo "::warning::virtualizationservice binding not found; continuing because the forbidden fuzzer reference is absent."
-            fi
-          else
-            echo "Virtualization tree is present; no CI diet sepolicy verification required."
-          fi
-
-          echo "=== VERIFY REAL RESTORED/STAGED PROVIDERS ==="
-          test -f "$ANDROID_BUILD_TOP/ci-diet/development-provider/sdk/plat_tools_source.prop_template"
-          test -f "$ANDROID_BUILD_TOP/ci-diet/development-provider/scripts/symbol.py"
-          test -n "$(find "$ANDROID_BUILD_TOP/ci-diet/development-provider/python-packages/adb" -type f -name '*.py' -print -quit)"
-
-          grep -n 'name: "platform_tools_version"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
-          grep -n 'name: "python-symbol"' "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
-          grep -n 'name: "adb_py"' "$ANDROID_BUILD_TOP/ci-diet/development-provider/python-packages/adb/Android.bp"
-          test -f "$ANDROID_BUILD_TOP/ci-diet/development-provider/host/windows/prebuilt/usb/AdbWinApi.dll"
-          grep -n -E 'name:[[:space:]]*"(AdbWinApi|AdbWinUsbApi)"' \
-            "$ANDROID_BUILD_TOP/ci-diet/development-provider/host/windows/Android.bp"
-          test -f "$ANDROID_BUILD_TOP/external/eigen/Android.bp"
-          grep -n 'name: "libeigen"' "$ANDROID_BUILD_TOP/external/eigen/Android.bp" | head -1
-
-          test -f "$ANDROID_BUILD_TOP/ci-diet/vts-vintf-common/Android.bp"
-          grep -n 'name: "libvts_vintf_test_common"'             "$ANDROID_BUILD_TOP/ci-diet/vts-vintf-common/Android.bp"
-
-          echo "=== VERIFY CI DIET STUBS BEFORE SOONG ==="
-          test -s "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
-          grep -n -E 'name: "(cts_defaults|cts_support_defaults|cts_error_prone_rules|cts_error_prone_rules_tests|mts-target-sdk-version-current|platform_tools_version|python-symbol)"'             "$ANDROID_BUILD_TOP/ci-diet/Android.bp"
-
-          echo "=== GENERATE BUILD GRAPH ==="
-          m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
-
-          BUILD_NINJA="$ANDROID_BUILD_TOP/out/combined-${TARGET_PRODUCT}.ninja"
-
-          if [ ! -s "$BUILD_NINJA" ]; then
-            echo "::warning::Expected combined ninja was not found at: $BUILD_NINJA"
-            BUILD_NINJA="$(
-              find "$ANDROID_BUILD_TOP/out" \
-                -maxdepth 1 \
-                -type f \
-                -name 'combined*.ninja' \
-                -print | head -1
-            )"
-          fi
-
-          if [ -z "${BUILD_NINJA:-}" ] || [ ! -s "$BUILD_NINJA" ]; then
-            echo "::error::Could not locate the generated combined Ninja graph."
-            find "$ANDROID_BUILD_TOP/out" -maxdepth 2 -type f -name '*.ninja' -print | head -100 || true
-            exit 1
-          fi
-
-          echo "BUILD_NINJA=$BUILD_NINJA" | tee /tmp/rbe-test/build-ninja.txt
-
-          echo "=== VERIFY REWRAPPER IS PRESENT IN GENERATED GRAPH ==="
-          : > /tmp/rbe-test/rewrapper-ninja-matches.txt
-          FOUND_REWRAPPER=0
-
-          for ninja_file in \
-            "$ANDROID_BUILD_TOP/out/soong/build.ninja" \
-            "$BUILD_NINJA"; do
-            if [ -s "$ninja_file" ]; then
-              if grep -n -m 20 -E 'remoteexecution-client/.*/rewrapper|(^|[ /])rewrapper([ "]|$)' \
-                "$ninja_file" \
-                | tee -a /tmp/rbe-test/rewrapper-ninja-matches.txt; then
-                FOUND_REWRAPPER=1
-              fi
+      - name: BuildBuddy RBE smoke compile (after graph passes)
+        if: ${{ inputs.run_mode == 'rbe-smoke' }}
+        shell: bash
+        timeout-minutes: 90
+        env:
+          USE_RBE: '1'
+          RBE_remote_headers: x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$ANDROID_BUILD_TOP"
+          test -x "$RBE_DIR/rewrapper"
+          test -x "$RBE_DIR/reproxy"
+          source build/envsetup.sh
+          breakfast star2lte userdebug
+          echo '=== RBE C++ SMOKE: libbase ==='
+          m -j"$BUILD_JOBS" libbase 2>&1 | tee "$REPORT_DIR/rbe-libbase.log"
+          echo 'Compile finished; remote execution confirmation requires RBE metrics.'
+          ls -lah "$REPORT_DIR/rbe" || true
+          for f in "$REPORT_DIR/rbe"/rbe_metrics.txt; do
+            if [ -s "$f" ]; then
+              grep -Ei 'remote|local|cache|action' "$f" | tail -n 80 || true
             fi
           done
 
-          if [ "$FOUND_REWRAPPER" -ne 1 ]; then
-            echo "::error::RBE is enabled, but no rewrapper command was found in the generated Ninja graph."
-            echo "This means the C/C++ actions are not actually being routed through reclient."
-            exit 1
+      - name: Build complete ROM
+        if: ${{ inputs.run_mode == 'full-rom' }}
+        shell: bash
+        timeout-minutes: 180
+        env:
+          USE_RBE: ${{ inputs.enable_rbe && '1' || '0' }}
+          RBE_remote_headers: x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$ANDROID_BUILD_TOP"
+          source build/envsetup.sh
+          breakfast star2lte userdebug
+          if [ "$USE_RBE" = 1 ]; then
+            test -x "$RBE_DIR/rewrapper"
+            test -x "$RBE_DIR/reproxy"
           fi
+          echo '=== FULL ROM BUILD: bacon ==='
+          m -j"$BUILD_JOBS" bacon 2>&1 | tee "$REPORT_DIR/full-rom.log"
+          ls -lh out/target/product/star2lte/lineage-*.zip
+          sha256sum out/target/product/star2lte/lineage-*.zip \
+            | tee "$REPORT_DIR/rom-sha256.txt"
 
-          echo "=== REAL C++ BUILD: libbase ==="
-          echo "This is intentionally a clean source-output build without restored ccache."
-          echo "RBE_CXX_EXEC_STRATEGY=remote makes a remote failure fatal instead of silently falling back locally."
-
-          m -j1 libbase 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
-
-          echo "=== RBE OUTPUT FILES ==="
-          find /tmp/rbe-test \
-            -maxdepth 2 \
-            -type f \
-            -printf '%p %s bytes\n' \
-            | sort \
-            | tee /tmp/rbe-test/rbe-files.txt
-
-          echo "=== RBE METRICS ==="
-          if [ -s /tmp/rbe-test/rbe_metrics.txt ]; then
-            cat /tmp/rbe-test/rbe_metrics.txt
-          else
-            echo "::warning::rbe_metrics.txt was not produced by this reclient version."
-          fi
-
-          echo "=== RBE ERROR SCAN ==="
-          grep -R -n -E \
-            'Unauthenticated|PermissionDenied|PERMISSION_DENIED|UNAUTHENTICATED|credential|authentication|FAILED|FATAL|ERROR' \
-            /tmp/rbe-test \
-            --exclude='real-cxx-compile.log' \
-            --exclude='m-nothing.log' \
-            2>/dev/null | head -200 || true
-
-          echo "=== RBE TEST PASSED ==="
-          echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_RELEASE}-${TARGET_BUILD_VARIANT}"
-          echo "Real C++ module build completed with RBE_CXX_EXEC_STRATEGY=remote."
-
-      - name: RBE diagnostics
-        if: always()
-        working-directory: /home/runner/work/los
+      - name: Collect diagnostics even on failure
+        if: ${{ always() }}
         shell: bash
         run: |
           set +e
+          mkdir -p "$REPORT_DIR"
+          {
+            date -u
+            df -h "$GITHUB_WORKSPACE" "$ANDROID_BUILD_TOP"
+            free -h
+            echo '=== top-level source sizes ==='
+            for p in prebuilts external frameworks packages hardware \
+              system build device vendor out .repo; do
+              if [ -e "$ANDROID_BUILD_TOP/$p" ]; then
+                du -sh "$ANDROID_BUILD_TOP/$p" 2>/dev/null
+              fi
+            done
+          } > "$REPORT_DIR/99-final-diagnostics.txt" 2>&1
+          if [ -d "$ANDROID_BUILD_TOP/out" ]; then
+            find "$ANDROID_BUILD_TOP/out" -maxdepth 4 -type f \
+              \( -name '*error*' -o -name 'soong.log' \) \
+              -print > "$REPORT_DIR/soong-log-locations.txt" 2>/dev/null
+          fi
+          # Copy small textual Soong logs if available; skip huge intermediates.
+          for f in "$ANDROID_BUILD_TOP/out/soong.log" \
+                   "$ANDROID_BUILD_TOP/out/verbose.log.gz"; do
+            if [ -f "$f" ]; then cp "$f" "$REPORT_DIR/"; fi
+          done
 
-          mkdir -p /tmp/rbe-test
-
-          echo "=== SAFE RBE ENV ==="
-          cat /tmp/rbe-test/rbe-env.txt 2>/dev/null || true
-
-          echo "=== RBE LOG DIRECTORY ==="
-          find /tmp/rbe-test \
-            -maxdepth 2 \
-            -type f \
-            -printf '%p %s bytes\n' \
-            | sort || true
-
-          echo "=== REPROXY PROCESSES ==="
-          ps aux | grep -E '[r]eproxy|[r]ewrapper|[s]candeps' || true
-
-          echo "=== DISK ==="
-          df -h / /home/runner/work/los || true
-
-          echo "=== REPROXY LOG TAIL ==="
-          tail -n 220 /tmp/rbe-test/reproxy_log.txt 2>/dev/null || true
-
-          echo "=== RBE METRICS ==="
-          cat /tmp/rbe-test/rbe_metrics.txt 2>/dev/null || true
-
-          echo "=== BUILD GRAPH LOG TAIL ==="
-          tail -n 160 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
-
-          echo "=== REAL C++ BUILD LOG TAIL ==="
-          tail -n 220 /tmp/rbe-test/real-cxx-compile.log 2>/dev/null || true
-
-      - name: Upload RBE test logs
-        if: always()
+      - name: Upload diagnostic artifacts
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: rbe-test-logs-${{ github.run_id }}
-          path: |
-            /tmp/rbe-test
-            /home/runner/work/los/.repo/repo.log
+          name: star2lte-v24-clean-${{ inputs.run_mode }}-${{ github.run_number }}
+          path: ci-reports/
           if-no-files-found: warn
           retention-days: 7
+          compression-level: 6
+
+      - name: Upload ROM zip (only on successful full build)
+        if: ${{ success() && inputs.run_mode == 'full-rom' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-22.2-star2lte-${{ github.run_number }}
+          path: android/out/target/product/star2lte/lineage-*.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
