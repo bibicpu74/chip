@@ -1,27 +1,56 @@
+
 <?xml version="1.0" encoding="UTF-8"?>
 <manifest>
 
-  <!-- Remotes -->
-  <remote name="lineage"
-          fetch="https://github.com/LineageOS" />
-  <remote name="themuppets"
-          fetch="https://github.com/TheMuppets" />
+    <!-- Device trees -->
+    <project
+        name="LineageOS/android_device_samsung_star2lte"
+        path="device/samsung/star2lte"
+        remote="github"
+        revision="lineage-20" />
 
-  <!-- Device Tree -->
-  <project name="LineageOS/android_device_samsung_star2lte" path="device/samsung/star2lte" remote="github" revision="lineage-20"/>
-  <project name="LineageOS/android_device_samsung_exynos9810-common" path="device/samsung/exynos9810-common" remote="github" revision="lineage-20"/>
-  <project name="LineageOS/android_device_samsung_slsi_sepolicy" path="device/samsung_slsi/sepolicy" remote="github" revision="lineage-20"/>
+    <project
+        name="LineageOS/android_device_samsung_exynos9810-common"
+        path="device/samsung/exynos9810-common"
+        remote="github"
+        revision="lineage-20" />
 
-  <!-- P0: Avoid syncing the macOS Clang toolchain on Linux build runners. -->
-  <remove-project name="platform/prebuilts/clang/host/darwin-x86" />
+    <project
+        name="LineageOS/android_device_samsung_slsi_sepolicy"
+        path="device/samsung_slsi/sepolicy"
+        remote="github"
+        revision="lineage-20" />
 
-  <!-- Kernel -->
-  <project name="LineageOS/android_kernel_samsung_exynos9810" path="kernel/samsung/exynos9810" remote="github" revision="lineage-20"/>
+    <!-- Kernel -->
+    <project
+        name="LineageOS/android_kernel_samsung_exynos9810"
+        path="kernel/samsung/exynos9810"
+        remote="github"
+        revision="lineage-20" />
 
-  <!-- Vendor -->
-  <project name="TheMuppets/proprietary_vendor_samsung_star2lte" path="vendor/samsung/star2lte" remote="github" revision="lineage-20"/>
+    <!-- Vendor: device-specific -->
+    <project
+        name="TheMuppets/proprietary_vendor_samsung_star2lte"
+        path="vendor/samsung/star2lte"
+        remote="github"
+        revision="lineage-20" />
 
-  <!-- Hardware -->
-  <project name="LineageOS/android_hardware_samsung" path="hardware/samsung" remote="github" revision="lineage-20"/>
+    <!-- Vendor: Exynos 9810 common (REQUIRED) -->
+    <project
+        name="TheMuppets/proprietary_vendor_samsung_exynos9810-common"
+        path="vendor/samsung/exynos9810-common"
+        remote="github"
+        revision="lineage-20" />
+
+    <!-- Samsung hardware -->
+    <project
+        name="LineageOS/android_hardware_samsung"
+        path="hardware/samsung"
+        remote="github"
+        revision="lineage-20" />
+
+    <!-- Storage optimization P0 -->
+    <remove-project
+        name="platform/prebuilts/clang/host/darwin-x86" />
 
 </manifest>
