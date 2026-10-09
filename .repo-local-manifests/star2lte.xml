@@ -1,79 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  LineageOS 22.2 (Android 15) local manifest for star2lte (Galaxy S9+ Exynos 9810).
-
-  Mirrors ExyHyperBrick's OWN lineage-22.2-wip roomservice.xml (the maintainer
-  behind the XDA LOS builds) — trimmed to what star2lte actually needs.
-
-  Changes vs the first (Skyshadow2022) cut, each backed by evidence:
-  - DROPPED  LineageOS/android_hardware_samsung_slsi_nfc: the repo has NO
-    lineage-22.2 branch (only 23.0+) and nothing in the 22.2 device trees
-    references hardware/samsung_slsi/nfc. Pinned as-is it broke repo sync.
-  - DROPPED  ExyHyperBrick/android_hardware_samsung_slsi_exynos_dtbh: not
-    needed at 22.2 — the dtbhtoolExynos host tool the device tree sets via
-    TARGET_CUSTOM_DTBTOOL (BoardConfigCommon.mk:81) is built from
-    LineageOS/android_hardware_samsung @ lineage-22.2
-    (dtbhtool/Android.bp, name: "dtbhtoolExynos").
-  - config + graphics now come from ExyHyperBrick's forks, exactly as in his
-    lineage-22.2-wip manifest (he carries 22.2-era fixes there).
-  - starlte/crownlte trees NOT added: only mentioned in comments inside
-    proprietary-files.txt, never referenced by path.
-
-  IMS/VoLTE (krazey ImsStack/ImsMedia) is intentionally left out of this
-  first build — add it back once a plain build boots.
-
-  Used on top of:  repo init -u https://github.com/LineageOS/android.git -b lineage-22.2
-  Place at:        .repo/local_manifests/star2lte.xml
--->
 <manifest>
 
-  <!-- ===== device / kernel / vendor (ExyHyperBrick @ lineage-22.2) ===== -->
-  <!-- kernel: OUR fork (Skyshadow2020) = his lineage-22.2 tree + SUSFS v2.2.0
-       + KernelSU-Next (KSU_VERSION 33250 pin, manual hooks) + the madera
-       audio boot-race fix. Same base, same layout, same defconfig name —
-       only the repo differs. Flip back to ExyHyperBrick for a vanilla build. -->
-  <project name="Skyshadow2020/android_kernel_samsung_exynos9810"
-           path="kernel/samsung/exynos9810" remote="github" revision="lineage-22.2" />
-  <project name="ExyHyperBrick/android_device_samsung_exynos9810-common"
-           path="device/samsung/exynos9810-common" remote="github" revision="lineage-22.2" />
-  <project name="ExyHyperBrick/android_device_samsung_star2lte"
-           path="device/samsung/star2lte" remote="github" revision="lineage-22.2" />
-  <project name="ExyHyperBrick/proprietary_vendor_samsung_exynos9810-common"
-           path="vendor/samsung/exynos9810-common" remote="github" revision="lineage-22.2" />
-  <project name="ExyHyperBrick/proprietary_vendor_samsung_star2lte"
-           path="vendor/samsung/star2lte" remote="github" revision="lineage-22.2" />
+  <!-- Remotes -->
+  <remote name="lineage"
+          fetch="https://github.com/LineageOS" />
+  <remote name="themuppets"
+          fetch="https://github.com/TheMuppets" />
 
-      <!-- P0: Avoid syncing the macOS Clang toolchain on Linux build runners. -->
-    <remove-project name="platform/prebuilts/clang/host/darwin-x86" />
+  <!-- Device Tree -->
+  <project name="LineageOS/android_device_samsung_star2lte" path="device/samsung/star2lte" remote="lineage" revision="lineage-20"/>
+  <project name="LineageOS/android_device_samsung_exynos9810-common" path="device/samsung/exynos9810-common" remote="lineage" revision="lineage-20"/>
+  <project name="LineageOS/android_device_samsung_slsi_sepolicy" path="device/samsung_slsi/sepolicy" remote="lineage" revision="lineage-20"/>
 
-  <!-- ===== Samsung/Exynos HALs & sepolicy (pinned to ExyHyperBrick's
-       lineage-22.2-wip choices) ===== -->
-  <project name="LineageOS/android_device_samsung_slsi_sepolicy"
-           path="device/samsung_slsi/sepolicy" remote="github" revision="lineage-22.2" />
-  <!-- run #10 lesson: hardware/samsung's Android.bp imports the namespace
-       hardware/google/pixel, and hardware/qcom/sm8150/display imports
-       hardware/google/interfaces — these two CANNOT be dieted (their
-       remove-project lines were dropped; the default.xml projects stay). -->
-  <project name="LineageOS/android_hardware_samsung"
-           path="hardware/samsung" remote="github" revision="lineage-22.2" />
-  <project name="ExyHyperBrick/android_hardware_samsung_slsi-linaro_config"
-           path="hardware/samsung_slsi-linaro/config" remote="github" revision="lineage-22.2" />
-  <project name="LineageOS/android_hardware_samsung_slsi-linaro_exynos"
-           path="hardware/samsung_slsi-linaro/exynos" remote="github" revision="lineage-22.2" />
-  <project name="LineageOS/android_hardware_samsung_slsi-linaro_exynos5"
-           path="hardware/samsung_slsi-linaro/exynos5" remote="github" revision="lineage-22.2" />
-  <project name="ExyHyperBrick/android_hardware_samsung_slsi-linaro_graphics"
-           path="hardware/samsung_slsi-linaro/graphics" remote="github" revision="lineage-22.2" />
-  <project name="LineageOS/android_hardware_samsung_slsi-linaro_interfaces"
-           path="hardware/samsung_slsi-linaro/interfaces" remote="github" revision="lineage-22.2" />
-  <project name="LineageOS/android_hardware_samsung_slsi-linaro_openmax"
-           path="hardware/samsung_slsi-linaro/openmax" remote="github" revision="lineage-22.2" />
+  <!-- P0: Avoid syncing the macOS Clang toolchain on Linux build runners. -->
+  <remove-project name="platform/prebuilts/clang/host/darwin-x86" />
 
-  <!-- ===== v24-clean baseline =====
-       This local manifest ONLY adds the star2lte device, kernel, vendor and
-       Exynos HAL repositories listed above. Do not remove default AOSP/LOS
-       projects here: Soong needs source-level providers across the tree.
-       No empty Android.bp stubs, repo-sparse source patches or CI pruning.
-       Disk constraints are measured and reported by the workflow, not hidden.
-  -->
+  <!-- Kernel -->
+  <project name="LineageOS/android_kernel_samsung_exynos9810" path="kernel/samsung/exynos9810" remote="lineage" revision="lineage-20"/>
+
+  <!-- Vendor -->
+  <project name="TheMuppets/proprietary_vendor_samsung_star2lte" path="vendor/samsung/star2lte" remote="themuppets" revision="lineage-20"/>
+
+  <!-- Hardware -->
+  <project name="LineageOS/android_hardware_samsung" path="hardware/samsung" remote="lineage" revision="lineage-20"/>
+
 </manifest>
