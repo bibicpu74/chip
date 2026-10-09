@@ -153,9 +153,9 @@ jobs:
             --no-use-superproject --no-clone-bundle \
             "${extra[@]}" 2>&1 | tee "$REPORT_DIR/repo-init.log"
 
-          source_manifest="$GITHUB_WORKSPACE/config-repo/.repo-local-manifests/star2lte-v24-clean.xml"
+          source_manifest="$GITHUB_WORKSPACE/config-repo/.repo-local-manifests/star2lte.xml"
           if [ ! -s "$source_manifest" ]; then
-            echo "::error::Commit the clean manifest at .repo-local-manifests/star2lte-v24-clean.xml: $source_manifest"
+            echo "::error::Commit the clean manifest at .repo-local-manifests/star2lte.xml: $source_manifest"
             exit 1
           fi
 
