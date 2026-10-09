@@ -1,4 +1,4 @@
-name: LineageOS 18.1 - star2lte Full ROM Trial (BuildBuddy RBE)
+name: LineageOS 20.0 - star2lte Full ROM Trial (BuildBuddy RBE)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: los18-star2lte-rbe-full-rom-trial
+  group: los20-star2lte-rbe-full-rom-trial
   cancel-in-progress: true
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
       RBE_DIR: "prebuilts/remoteexecution-client/live"
       RBE_CXX_EXEC_STRATEGY: "remote"
 
-      # The Android 11 reclient 0.25.x does not support RBE_remote_headers.
+      # The legacy reclient used by this pipeline cannot attach RBE_remote_headers.
       # Forward plaintext h2c on loopback to a TLS-verified nginx gRPC proxy
       # which attaches BuildBuddy's x-buildbuddy-api-key header.
       RBE_service: "127.0.0.1:19099"
@@ -184,8 +184,39 @@ jobs:
 
           cp "$MANIFEST_SRC" "$MANIFEST_DST"
 
+          # P0: remove the oversized multi-version reclient checkout BEFORE sync.
+          # -a is required because no worktree has been checked out yet.
+          # The pinned toolchain is fetched separately after sync and must be
+          # self-contained. Never remove other Android prebuilts here.
+          echo "=== P0 RECLIENT PROJECT BEFORE TRIM ==="
+          repo list -a -p > /tmp/rbe-test/manifest-projects-before-trim.txt
+          if ! grep -Fxq 'prebuilts/remoteexecution-client' \
+            /tmp/rbe-test/manifest-projects-before-trim.txt; then
+            echo "::error::Expected remoteexecution-client project is missing from the manifest; review before trimming."
+            exit 1
+          fi
+
+          cat > .repo/local_manifests/zz-storage-trim.xml <<'EOFTRIM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+              <remove-project path="prebuilts/remoteexecution-client" optional="true" />
+          </manifest>
+          EOFTRIM
+
+          repo list -a -p > /tmp/rbe-test/manifest-projects-after-trim.txt
+          if grep -Fxq 'prebuilts/remoteexecution-client' \
+            /tmp/rbe-test/manifest-projects-after-trim.txt; then
+            echo "::error::P0 trim failed: reclient project is still in the effective manifest."
+            exit 1
+          fi
+          repo manifest -o /tmp/rbe-test/effective-manifest-after-trim.xml
+          echo 'P0 trim verified: prebuilts/remoteexecution-client will NOT be repo-synced.' \
+            | tee /tmp/rbe-test/p0-storage-trim-status.txt
+
           echo "=== LOCAL MANIFEST ==="
           sed -n '1,260p' "$MANIFEST_DST"
+          echo "=== P0 STORAGE TRIM MANIFEST ==="
+          cat .repo/local_manifests/zz-storage-trim.xml
 
       - name: Repo sync
         working-directory: /home/runner/work/los
@@ -383,7 +414,6 @@ jobs:
           PINNED_COMMIT="5148d33653fe6920633e405fd990b525f5bce912"
           PINNED_VERSION="0.57.0.4865132"
           DEST="prebuilts/remoteexecution-client/compat-${PINNED_VERSION}"
-          ORIGINAL="prebuilts/remoteexecution-client/live"
           FETCH_DIR="$RUNNER_TEMP/reclient-pinned"
 
           mkdir -p "$FETCH_DIR" "$DEST" /tmp/rbe-test
@@ -398,27 +428,31 @@ jobs:
           git -C "$FETCH_DIR" checkout -q --detach FETCH_HEAD
           test "$(git -C "$FETCH_DIR" rev-parse HEAD)" = "$PINNED_COMMIT"
 
-          # Use binaries from the SAME prebuilt release. The original
-          # dependency-scanner files are retained only if not shipped by it.
+          # Use one coherent pinned release, without any fallback into a
+          # repo-synced "live" tree. Copying the whole pinned directory also
+          # keeps dependency scanner libraries and symlinks from this release.
+          test -d "$FETCH_DIR/$PINNED_VERSION"
+          cp -a "$FETCH_DIR/$PINNED_VERSION/." "$DEST/"
           for bin in rewrapper reproxy bootstrap; do
-            test -s "$FETCH_DIR/$PINNED_VERSION/$bin"
-            install -m 0755 "$FETCH_DIR/$PINNED_VERSION/$bin" "$DEST/$bin"
+            test -s "$DEST/$bin"
+            test -x "$DEST/$bin" || chmod 0755 "$DEST/$bin"
           done
-          for bin in dumpstats scandeps_server; do
-            if [ -s "$FETCH_DIR/$PINNED_VERSION/$bin" ]; then
-              install -m 0755 "$FETCH_DIR/$PINNED_VERSION/$bin" "$DEST/$bin"
-            elif [ -x "$ORIGINAL/$bin" ]; then
-              cp -L "$ORIGINAL/$bin" "$DEST/$bin"
-              chmod 0755 "$DEST/$bin"
-            fi
-          done
-          for lib in dependency_scanner_go_plugin.so; do
-            if [ -f "$FETCH_DIR/$PINNED_VERSION/$lib" ]; then
-              cp "$FETCH_DIR/$PINNED_VERSION/$lib" "$DEST/$lib"
-            elif [ -f "$ORIGINAL/$lib" ]; then
-              cp -L "$ORIGINAL/$lib" "$DEST/$lib"
-            fi
-          done
+          # The one-time shallow/sparse clone is no longer needed during build.
+          rm -rf "$FETCH_DIR"
+
+          echo '=== P0 PINNED RECLIENT STORAGE ==='
+          du -sh "$DEST" prebuilts/remoteexecution-client 2>/dev/null \
+            | tee /tmp/rbe-test/p0-reclient-size.txt
+          if [ -e prebuilts/remoteexecution-client/live ]; then
+            echo '::error::Unexpected repo-synced reclient/live directory; P0 trim was bypassed.'
+            exit 1
+          fi
+          printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" 'post-pinned-reclient' \
+            "$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')" \
+            "$(df -B1 --output=used "$PWD" | tail -n1 | tr -d ' ')" \
+            "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" \
+            >> /tmp/rbe-test/resource-samples.tsv
 
           printf 'pinned_commit=%s\npinned_version=%s\n' \
             "$PINNED_COMMIT" "$PINNED_VERSION" \
@@ -568,7 +602,7 @@ jobs:
 
           mkdir -p /tmp/rbe-test
 
-          # LineageOS 22.2 / Android 11 uses PRODUCT-VARIANT format.
+          # LineageOS 20.0 uses PRODUCT-VARIANT format.
           # TARGET_RELEASE and aosp_target_release are for newer build trees.
           if [ ! -f build/envsetup.sh ]; then
             echo "::error::Missing build/envsetup.sh; check repo sync and working-directory."
@@ -577,7 +611,7 @@ jobs:
           source build/envsetup.sh
           lunch lineage_star2lte-userdebug
 
-          # Use the checked-out JDK 11 for Android 11 host Java build stages.
+          # Prefer the checked-out JDK 11 if this tree selects it.
           # RBE and Android Soong toolchain remain otherwise unchanged.
           if [ -x "$PWD/prebuilts/jdk/jdk11/linux-x86/bin/java" ]; then
             export JAVA_HOME="$PWD/prebuilts/jdk/jdk11/linux-x86"
@@ -885,7 +919,7 @@ jobs:
           mkdir -p /tmp/rbe-test
           FILE=/tmp/rbe-test/resource-samples.tsv
           {
-            echo '## LineageOS 18.1 full ROM trial — disk and RAM'
+            echo '## LineageOS 20.0 full ROM trial — disk and RAM'
             echo ''
             echo '| Stage (UTC) | Free GiB | Used GiB | RAM available GiB |'
             echo '|---|---:|---:|---:|'
@@ -960,6 +994,18 @@ jobs:
               echo 'No prebuilts manifest project list was captured.'
             fi
             echo 'Storage profiling did not modify source or Git objects.'
+            echo ''
+            echo '### P0 reclient trim'
+            if [ -s /tmp/rbe-test/p0-storage-trim-status.txt ]; then
+              cat /tmp/rbe-test/p0-storage-trim-status.txt
+            else
+              echo 'P0 trim did not finish; see diagnostic artifact.'
+            fi
+            if [ -s /tmp/rbe-test/p0-reclient-size.txt ]; then
+              echo '```text'
+              cat /tmp/rbe-test/p0-reclient-size.txt
+              echo '```'
+            fi
             echo ''
             echo '### ROM output'
             if [ -s /tmp/rbe-test/rom-filename.txt ]; then
