@@ -170,7 +170,7 @@ jobs:
           repo init \
             --depth=1 \
             -u https://github.com/LineageOS/android.git \
-            -b lineage-22.2
+            -b lineage-20
 
           mkdir -p .repo/local_manifests
 
@@ -871,7 +871,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: lineage-22.2-star2lte-${{ github.run_id }}
+          name: lineage-20-star2lte-${{ github.run_id }}
           path: /home/runner/work/los/out/target/product/star2lte/lineage-*.zip
           if-no-files-found: error
           compression-level: 0
