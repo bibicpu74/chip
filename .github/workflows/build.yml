@@ -8,7 +8,7 @@ permissions:
 
 concurrency:
   group: los20-star2lte-rbe-full-rom-trial
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   rbe-test:
@@ -46,8 +46,10 @@ jobs:
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
       # GiB of available disk space (statvfs/df -B1, not rounded df -h).
-      DISK_WARN_GIB: "25"
-      DISK_STOP_GIB: "15"
+      # Experimental 7-GiB floor requested for a deeper build trial.
+      # Never let the free space reach zero; packaging may still need more.
+      DISK_WARN_GIB: "15"
+      DISK_STOP_GIB: "7"
       # Stop the long build early enough to upload logs and a successful ROM.
       # Whole-job limit on GitHub-hosted runners: 360 minutes.
       FULL_ROM_SOFT_DEADLINE_MINUTES: "320"
@@ -598,7 +600,7 @@ jobs:
         timeout-minutes: 325
         shell: bash
         run: |
-          set -Eeo pipefail
+          set -eo pipefail
           mkdir -p /tmp/rbe-test
 
           # P0.1: capture early setup output, even when envsetup or lunch fails
@@ -619,7 +621,7 @@ jobs:
             LAST_FAILURE_LINE="$1"
             LAST_FAILURE_COMMAND="$2"
             # Never enable set -x: BuildBuddy credentials are in the environment.
-            printf 'Failure observed at line=%s in stage=%s\n' "$LAST_FAILURE_LINE" "$CURRENT_STAGE"
+            printf 'Failure observed at line=%s in stage=%s\n' "$LAST_FAILURE_LINE" "$CURRENT_STAGE" >&2
           }
           on_exit() {
             local rc=$?
@@ -648,7 +650,18 @@ jobs:
                 > /tmp/rbe-test/configure-success.txt
             fi
           }
+          on_signal() {
+            local signal="$1" rc="$2"
+            trap - TERM INT
+            printf 'signal=%s\nstage=%s\ntimestamp=%s\n' \
+              "$signal" "$CURRENT_STAGE" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              > /tmp/rbe-test/termination-signal.txt
+            echo "::error::Received $signal during $CURRENT_STAGE (possible GitHub cancellation / step timeout)." >&2
+            exit "$rc"
+          }
           trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+          trap 'on_signal TERM 143' TERM
+          trap 'on_signal INT 130' INT
           trap on_exit EXIT
           mark_stage configure-start
 
@@ -668,11 +681,29 @@ jobs:
             echo "::error::Missing build/envsetup.sh; check repo sync and working-directory."
             exit 1
           fi
+          # Android envsetup/lunch are designed to run in an interactive-like
+          # shell. Avoid inherited ERR traps changing command-substitution output
+          # (previously visible as the bogus ".../Failure observed" filename).
+          trap - ERR
+          set +e
           mark_stage envsetup
           source build/envsetup.sh
+          ENVSETUP_RC=$?
+          if [ "$ENVSETUP_RC" -ne 0 ]; then
+            echo "::error::envsetup.sh returned $ENVSETUP_RC" >&2
+            exit "$ENVSETUP_RC"
+          fi
           echo '=== ENVSETUP PASSED ==='
           mark_stage lunch
           lunch lineage_star2lte-userdebug
+          LUNCH_RC=$?
+          # Restore strict error checking only after the Lineage shell setup.
+          set -e
+          trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+          if [ "$LUNCH_RC" -ne 0 ]; then
+            echo "::error::lunch returned $LUNCH_RC" >&2
+            exit "$LUNCH_RC"
+          fi
           echo '=== LUNCH PASSED ==='
           mark_stage java-selection
 
@@ -775,15 +806,120 @@ jobs:
             fi
             echo "=== DISK AT ${stage}: $((available / 1073741824)) GiB free ==="
           }
-          enforce_initial_disk_guard pre-graph
+          # The 320-minute deadline is measured from post-reclaim, not from
+          # the start of bacon. Supervise Soong graph generation as well.
+          if [ -s /tmp/rbe-test/job-start-epoch.txt ]; then
+            JOB_START_EPOCH="$(cat /tmp/rbe-test/job-start-epoch.txt)"
+          else
+            JOB_START_EPOCH="$(date +%s)"
+          fi
+          SOFT_DEADLINE_EPOCH=$(( JOB_START_EPOCH + FULL_ROM_SOFT_DEADLINE_MINUTES * 60 ))
+          echo "=== WHOLE-JOB SOFT DEADLINE (UTC) ==="
+          date -u -d "@$SOFT_DEADLINE_EPOCH" +'%Y-%m-%dT%H:%M:%SZ'
+          if (( $(date +%s) >= SOFT_DEADLINE_EPOCH )); then
+            echo '::error::Whole-job soft deadline already reached before Soong graph generation.'
+            exit 71
+          fi
 
+          stop_process_tree() {
+            local pid="$1" child
+            while IFS= read -r child; do
+              [ -n "$child" ] || continue
+              stop_process_tree "$child"
+            done < <(pgrep -P "$pid" 2>/dev/null || true)
+            kill -TERM "$pid" 2>/dev/null || true
+          }
+          # Shared supervisor for both 'nothing' and 'bacon'. It records an
+          # explicit phase exit code and distinguishes disk/time stops from
+          # compiler errors; an external SIGTERM is separately captured above.
+          run_monitored_m() {
+            local phase="$1" target="$2" log_file="$3" status_file="$4"
+            local disk_trip="$5" time_trip="$6"
+            local available now free_gib mem_kib seconds_left last_write idle_secs
+            local line wait_rc warned=0 idle_warned=0 tick
+            rm -f "$status_file" "$disk_trip" "$time_trip"
+            (
+              # Avoid trap messages being written into Soong's stdout.
+              trap - ERR TERM INT
+              set +e
+              set -o pipefail
+              m -j2 --skip-soong-tests "$target" 2>&1 | tee "$log_file"
+              rc=${PIPESTATUS[0]}
+              printf '%s\n' "$rc" > "$status_file"
+              exit "$rc"
+            ) &
+            BUILD_PID=$!
+            echo "=== $phase PID=$BUILD_PID; 30s DISK / RAM / TIME SUPERVISOR ==="
+            while kill -0 "$BUILD_PID" 2>/dev/null; do
+              available="$(disk_sample "$phase-sample")"
+              now="$(date +%s)"
+              free_gib=$((available / 1073741824))
+              mem_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+              seconds_left=$((SOFT_DEADLINE_EPOCH - now))
+              last_write="$(stat -c '%Y' "$log_file" 2>/dev/null || printf '%s\n' "$now")"
+              idle_secs=$((now - last_write))
+              if (( idle_secs < 0 )); then idle_secs=0; fi
+              line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID free=${free_gib}GiB mem_available=${mem_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s"
+              echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
+
+              if (( available < DISK_STOP_GIB * 1073741824 )); then
+                echo "Disk safety stop in $phase: available below ${DISK_STOP_GIB} GiB" | tee "$disk_trip"
+                echo "::error::Insufficient disk in $phase; terminating children."
+                stop_process_tree "$BUILD_PID"
+                break
+              fi
+              if (( now >= SOFT_DEADLINE_EPOCH )); then
+                echo "Time safety stop in $phase: passed ${FULL_ROM_SOFT_DEADLINE_MINUTES}-minute whole-job deadline" | tee "$time_trip"
+                echo "::error::Stopping $phase before GitHub job timeout to preserve diagnostics."
+                stop_process_tree "$BUILD_PID"
+                break
+              fi
+              if (( available < DISK_WARN_GIB * 1073741824 && warned == 0 )); then
+                echo "::warning::Less than ${DISK_WARN_GIB} GiB available in $phase."
+                warned=1
+              fi
+              if (( idle_secs >= 900 && idle_warned == 0 )); then
+                echo "::warning::$phase has produced no new log output for 15 minutes; inspect CPU/process state."
+                ps -o pid,ppid,stat,etime,%cpu,%mem,args -p "$BUILD_PID" || true
+                idle_warned=1
+              fi
+              for ((tick=0; tick<6; tick++)); do
+                kill -0 "$BUILD_PID" 2>/dev/null || break
+                sleep 5
+              done
+            done
+            set +e
+            wait "$BUILD_PID"
+            wait_rc=$?
+            set -e
+            BUILD_PID=''
+            MONITORED_RC="$wait_rc"
+            if [ -s "$status_file" ]; then MONITORED_RC="$(cat "$status_file")"; fi
+            if [ -s "$disk_trip" ]; then MONITORED_RC=70; fi
+            if [ -s "$time_trip" ]; then MONITORED_RC=71; fi
+            disk_sample "post-$phase" >/dev/null
+            echo "=== $phase EXIT: $MONITORED_RC ==="
+          }
+
+          enforce_initial_disk_guard pre-graph
           mark_stage build-graph
           # From here m-nothing.log and full-rom-build.log capture build output.
-          # Do not mirror many gigabytes of compiler output into configure-setup.log.
+          # Do not mirror compiler output into configure-setup.log.
           exec 1>&3 2>&4
           exec 3>&- 4>&-
-          echo "=== GENERATE BUILD GRAPH ==="
-          m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
+          : > /tmp/rbe-test/resource-monitor.log
+          echo '=== GENERATE BUILD GRAPH (SKIP SOONG UNIT TESTS) ==='
+          run_monitored_m build-graph nothing \
+            /tmp/rbe-test/m-nothing.log \
+            /tmp/rbe-test/graph-exit-code.txt \
+            /tmp/rbe-test/graph-disk-stop-triggered.txt \
+            /tmp/rbe-test/graph-time-stop-triggered.txt
+          if [ "$MONITORED_RC" -ne 0 ]; then
+            echo '=== BUILD GRAPH LOG TAIL ==='
+            tail -n 180 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
+            echo "::error::Soong build graph failed or was stopped (exit $MONITORED_RC)."
+            exit "$MONITORED_RC"
+          fi
           enforce_initial_disk_guard post-graph
 
           BUILD_NINJA="$ANDROID_BUILD_TOP/out/combined-${TARGET_PRODUCT}.ninja"
@@ -844,100 +980,17 @@ jobs:
           echo "The previous libbase test passed; this run compiles and packages the full ROM."
           enforce_initial_disk_guard pre-build
 
-          BUILD_LOG=/tmp/rbe-test/full-rom-build.log
-          BUILD_STATUS_FILE=/tmp/rbe-test/build-exit-code.txt
-          DISK_TRIP_FILE=/tmp/rbe-test/disk-stop-triggered.txt
-          TIME_TRIP_FILE=/tmp/rbe-test/time-stop-triggered.txt
-          rm -f "$BUILD_STATUS_FILE" "$DISK_TRIP_FILE" "$TIME_TRIP_FILE"
-
-          if [ -s /tmp/rbe-test/job-start-epoch.txt ]; then
-            JOB_START_EPOCH="$(cat /tmp/rbe-test/job-start-epoch.txt)"
-          else
-            JOB_START_EPOCH="$(date +%s)"
-          fi
-          SOFT_DEADLINE_EPOCH=$(( JOB_START_EPOCH + FULL_ROM_SOFT_DEADLINE_MINUTES * 60 ))
-          echo "=== SOFT DEADLINE (UTC) ==="
-          date -u -d "@$SOFT_DEADLINE_EPOCH" +'%Y-%m-%dT%H:%M:%SZ'
           if (( $(date +%s) >= SOFT_DEADLINE_EPOCH )); then
-            echo "::error::Not enough job time remains to begin full ROM build."
+            echo '::error::Not enough whole-job time remains to begin full ROM build.'
             exit 71
           fi
-
+          BUILD_LOG=/tmp/rbe-test/full-rom-build.log
           mark_stage full-rom-build
-          # Run the build in a child shell and keep its exit status after tee.
-          # The supervisor retains control to stop on low disk/time.
-          (
-            set +e
-            set -o pipefail
-            m -j2 bacon 2>&1 | tee "$BUILD_LOG"
-            rc=${PIPESTATUS[0]}
-            printf '%s\n' "$rc" > "$BUILD_STATUS_FILE"
-            exit "$rc"
-          ) &
-          BUILD_PID=$!
-
-          stop_process_tree() {
-            local pid="$1" child
-            while IFS= read -r child; do
-              [ -n "$child" ] || continue
-              stop_process_tree "$child"
-            done < <(pgrep -P "$pid" 2>/dev/null || true)
-            kill -TERM "$pid" 2>/dev/null || true
-          }
-          cleanup_build_supervisor() {
-            if kill -0 "$BUILD_PID" 2>/dev/null; then
-              stop_process_tree "$BUILD_PID"
-            fi
-          }
-          # The single on_exit trap handles both child cleanup and stage logs.
-          echo '=== FULL ROM STORAGE / MEMORY / TIME MONITOR (30s) ==='
-          : > /tmp/rbe-test/resource-monitor.log
-          WARNED=0
-          while kill -0 "$BUILD_PID" 2>/dev/null; do
-            avail="$(disk_sample full-rom-sample)"
-            now="$(date +%s)"
-            free_gib=$((avail / 1073741824))
-            mem_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
-            seconds_left=$((SOFT_DEADLINE_EPOCH - now))
-            line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') free=${free_gib}GiB mem_available=${mem_kib}KiB soft_deadline_remaining=${seconds_left}s"
-            echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
-
-            if (( avail < DISK_STOP_GIB * 1073741824 )); then
-              echo "Disk safety stop: available below ${DISK_STOP_GIB} GiB" | tee "$DISK_TRIP_FILE"
-              echo "::error::Insufficient disk space; stopping full ROM build."
-              stop_process_tree "$BUILD_PID"
-              break
-            fi
-            if (( now >= SOFT_DEADLINE_EPOCH )); then
-              echo "Time safety stop: passed ${FULL_ROM_SOFT_DEADLINE_MINUTES} minute whole-job deadline" | tee "$TIME_TRIP_FILE"
-              echo "::error::Stopping build before the 6-hour GitHub job limit to preserve diagnostics."
-              stop_process_tree "$BUILD_PID"
-              break
-            fi
-            if (( avail < DISK_WARN_GIB * 1073741824 && WARNED == 0 )); then
-              echo "::warning::Less than ${DISK_WARN_GIB} GiB remains; full ROM build may be stopped."
-              WARNED=1
-            fi
-            # Wait up to 30 seconds without delaying a completed build.
-            for ((tick=0; tick<6; tick++)); do
-              kill -0 "$BUILD_PID" 2>/dev/null || break
-              sleep 5
-            done
-          done
-
-          set +e
-          wait "$BUILD_PID"
-          WAIT_RC=$?
-          set -e
-          BUILD_PID=''
-          BUILD_RC="$WAIT_RC"
-          if [ -s "$BUILD_STATUS_FILE" ]; then
-            BUILD_RC="$(cat "$BUILD_STATUS_FILE")"
-          fi
-          if [ -s "$DISK_TRIP_FILE" ]; then BUILD_RC=70; fi
-          if [ -s "$TIME_TRIP_FILE" ]; then BUILD_RC=71; fi
-          disk_sample post-full-rom-build >/dev/null
-          echo "=== FULL ROM BUILD EXIT: $BUILD_RC ==="
+          run_monitored_m full-rom-build bacon "$BUILD_LOG" \
+            /tmp/rbe-test/build-exit-code.txt \
+            /tmp/rbe-test/disk-stop-triggered.txt \
+            /tmp/rbe-test/time-stop-triggered.txt
+          BUILD_RC="$MONITORED_RC"
 
           if [ "$BUILD_RC" -ne 0 ]; then
             echo '=== BUILD ERROR LINES (LAST 120 MATCHES) ==='
@@ -1109,8 +1162,17 @@ jobs:
             else
               echo 'No verified ROM ZIP created in this run.'
             fi
-            if [ -s /tmp/rbe-test/time-stop-triggered.txt ]; then
-              echo '**Soft job deadline triggered; build stopped to retain diagnostics.**'
+            if [ -s /tmp/rbe-test/time-stop-triggered.txt ] || [ -s /tmp/rbe-test/graph-time-stop-triggered.txt ]; then
+              echo '**Soft job deadline triggered during graph generation or ROM build.**'
+            fi
+            if [ -s /tmp/rbe-test/graph-disk-stop-triggered.txt ]; then
+              echo '**Build graph stopped for low disk space.**'
+            fi
+            if [ -s /tmp/rbe-test/termination-signal.txt ]; then
+              echo '**External termination signal observed:**'
+              echo '```text'
+              cat /tmp/rbe-test/termination-signal.txt
+              echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo '=== FINAL DISK AND MEMORY ==='
@@ -1201,6 +1263,10 @@ jobs:
           tail -n 260 /tmp/rbe-test/full-rom-build.log 2>/dev/null || true
           echo "=== BUILD STOP REASONS ==="
           cat /tmp/rbe-test/*-stop-triggered.txt 2>/dev/null || true
+          echo '=== EXTERNAL TERMINATION SIGNAL ==='
+          cat /tmp/rbe-test/termination-signal.txt 2>/dev/null || true
+          echo '=== SOONG GRAPH EXIT CODE ==='
+          cat /tmp/rbe-test/graph-exit-code.txt 2>/dev/null || true
           echo "=== ROM ZIP FILES IF PRESENT ==="
           find /home/runner/work/los/out/target/product/star2lte -maxdepth 1 \
             -type f -name 'lineage-*.zip' -printf '%p %s bytes\n' 2>/dev/null || true
