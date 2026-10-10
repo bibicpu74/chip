@@ -47,8 +47,11 @@ jobs:
 
       # Soong graph generation is local even with BuildBuddy RBE.
       # Go GC is tuned for the standard ~16-GB GitHub runner.
-      SOONG_GOGC: "50"
-      SOONG_GOMEMLIMIT: "10GiB"
+      # P0: lower Go GC target; limit only activates with Go >= 1.19.
+      SOONG_GOGC: "25"
+      SOONG_GOMEMLIMIT: "6GiB"
+      # Limit active Go workers during the memory-heavy graph generation only.
+      SOONG_GRAPH_GOMAXPROCS: "2"
       # Reserve disk-backed swap only after repo sync, when disk is measured.
       SOONG_SWAP_GIB: "4"
 
@@ -711,6 +714,9 @@ jobs:
                 cat /sys/fs/cgroup/memory.events
               fi
               grep -E '^(oom_kill|pswpin|pswpout) ' /proc/vmstat || true
+              if declare -F record_memory_pressure >/dev/null; then
+                record_memory_pressure "signal-$signal" || true
+              fi
             } >> /tmp/rbe-test/memory-pressure.log 2>&1
             echo "::error::Received $signal during $CURRENT_STAGE; SIGTERM alone cannot distinguish cancellation from resource pressure." >&2
             exit "$rc"
@@ -773,13 +779,30 @@ jobs:
           fi
           export USE_CCACHE=0
           export CCACHE_DISABLE=1
-          # Soong is written in Go and runs on the runner, not BuildBuddy.
-          # A Go 1.19+ runtime honors GOMEMLIMIT as a SOFT memory limit.
+          # The Android 13 prebuilt Go toolchain may be older than Go 1.19.
+          # GOMEMLIMIT does not exist on Go 1.18; never claim it worked there.
           export GOGC="$SOONG_GOGC"
-          export GOMEMLIMIT="$SOONG_GOMEMLIMIT"
-          echo "=== SOONG GO GC: GOGC=$GOGC GOMEMLIMIT=$GOMEMLIMIT ==="
-          if [ -x "$PWD/prebuilts/go/linux-x86/bin/go" ]; then
-            "$PWD/prebuilts/go/linux-x86/bin/go" version || true
+          unset GOMEMLIMIT || true
+          GO_BIN="$PWD/prebuilts/go/linux-x86/bin/go"
+          GO_VERSION='unavailable'
+          GO_LIMIT_MODE='unsupported-or-unverified'
+          if [ -x "$GO_BIN" ]; then
+            GO_VERSION="$("$GO_BIN" version 2>&1 || true)"
+            if [[ "$GO_VERSION" =~ go([0-9]+)\.([0-9]+) ]]; then
+              GO_MAJOR="${BASH_REMATCH[1]}"
+              GO_MINOR="${BASH_REMATCH[2]}"
+              if (( GO_MAJOR > 1 || (GO_MAJOR == 1 && GO_MINOR >= 19) )); then
+                export GOMEMLIMIT="$SOONG_GOMEMLIMIT"
+                GO_LIMIT_MODE='enabled-soft-limit'
+              fi
+            fi
+          fi
+          printf 'go_tool=%s\ngo_version=%s\ngogc=%s\ngomemlimit_mode=%s\ngomemlimit_value=%s\n' \
+            "$GO_BIN" "$GO_VERSION" "$GOGC" "$GO_LIMIT_MODE" \
+            "${GOMEMLIMIT:-disabled}" > /tmp/rbe-test/soong-go-runtime.txt
+          cat /tmp/rbe-test/soong-go-runtime.txt
+          if [ "$GO_LIMIT_MODE" != 'enabled-soft-limit' ]; then
+            echo '::warning::Prebuilt Go is older than 1.19 or unverified: GOMEMLIMIT=6GiB cannot be guaranteed. GOGC=25 is still applied.'
           fi
           echo '=== SWAP ==='
           free -h
@@ -896,24 +919,105 @@ jobs:
             done < <(pgrep -P "$pid" 2>/dev/null || true)
             kill -TERM "$pid" 2>/dev/null || true
           }
-          # Capture top resident-memory processes without command-line args
-          # (which might contain credentials), plus kernel/cgroup OOM counters.
+          # Identify the current cgroup (GitHub-hosted Ubuntu usually uses v2).
+          # Always prefer the process's own cgroup, not host-wide counters.
+          CGROUP_MEMORY_DIR=''
+          if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
+            CGROUP_REL="$(awk -F: '$1=="0" {print $3; exit}' /proc/self/cgroup)"
+            if [ -d "/sys/fs/cgroup${CGROUP_REL}" ]; then
+              CGROUP_MEMORY_DIR="/sys/fs/cgroup${CGROUP_REL}"
+            elif [ -d /sys/fs/cgroup ]; then
+              CGROUP_MEMORY_DIR=/sys/fs/cgroup
+            fi
+          fi
+          cgroup_read() {
+            local name="$1" file
+            file="${CGROUP_MEMORY_DIR}/${name}"
+            if [ -n "$CGROUP_MEMORY_DIR" ] && [ -r "$file" ]; then
+              cat "$file" 2>/dev/null || printf 'na'
+            else
+              printf 'na'
+            fi
+          }
+          cgroup_event_value() {
+            local name="$1" file
+            file="${CGROUP_MEMORY_DIR}/memory.events"
+            if [ -n "$CGROUP_MEMORY_DIR" ] && [ -r "$file" ]; then
+              awk -v key="$name" '$1==key {print $2; found=1; exit} END {if (!found) print "na"}' "$file"
+            else
+              printf 'na'
+            fi
+          }
+          # Top RSS processes and Soong's VmRSS/VmHWM/VmSwap identify whether
+          # Go/Soong or another host process is consuming the RAM.
           record_memory_pressure() {
-            local label="$1"
+            local label="$1" pid
             {
               echo "=== $label $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
               free -h
               swapon --show || true
+              echo '--- TOP RSS (KiB; command names only; no args or secrets) ---'
               ps -eo pid,ppid,rss,stat,comm --sort=-rss | head -n 18 || true
+              echo '--- SOONG BUILD PROCESS DETAILS ---'
+              while IFS= read -r pid; do
+                [ -n "$pid" ] || continue
+                echo "pid=$pid"
+                grep -E '^(Name|State|VmRSS|VmHWM|VmSwap|VmSize|Threads):' \
+                  "/proc/$pid/status" 2>/dev/null || true
+                if [ -r "/proc/$pid/smaps_rollup" ]; then
+                  grep -E '^(Rss|Pss|Swap|Private_Dirty):' \
+                    "/proc/$pid/smaps_rollup" 2>/dev/null || true
+                fi
+              done < <(pgrep -x soong_build 2>/dev/null || true)
+              echo '--- CGROUP V2 MEMORY ---'
+              echo "cgroup_memory_dir=${CGROUP_MEMORY_DIR:-not-available}"
+              for metric in memory.current memory.peak memory.max memory.swap.current \
+                            memory.swap.peak memory.swap.max memory.events memory.events.local; do
+                printf '%s: ' "$metric"
+                if [[ "$metric" == *events* ]]; then printf '\n'; fi
+                cgroup_read "$metric"
+                printf '\n'
+              done
+              echo '--- PSI / HOST VMSTAT ---'
               [ ! -r /proc/pressure/memory ] || cat /proc/pressure/memory
-              if [ -r /sys/fs/cgroup/memory.events ]; then
-                cat /sys/fs/cgroup/memory.events
-              fi
               grep -E '^(oom_kill|pswpin|pswpout) ' /proc/vmstat || true
             } >> /tmp/rbe-test/memory-pressure.log 2>&1
           }
+          # Machine-readable samples preserve last-second state on cancellation.
+          SOONG_MEMORY_TSV=/tmp/rbe-test/soong-memory-samples.tsv
+          printf 'timestamp\tphase\tmem_available_kib\tswap_free_kib\tsoong_rss_kib\tsoong_hwm_kib\tsoong_swap_kib\tsoong_pids\tcgroup_memory_current_bytes\tcgroup_memory_peak_bytes\tcgroup_swap_current_bytes\tcgroup_swap_peak_bytes\tcgroup_oom\tcgroup_oom_kill\n' \
+            > "$SOONG_MEMORY_TSV"
+          sample_soong_memory() {
+            local phase="$1" pid rss=0 hwm=0 swap=0 pids=0 value
+            local mem_avail swap_free
+            mem_avail="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+            swap_free="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
+            while IFS= read -r pid; do
+              [ -n "$pid" ] || continue
+              [ -r "/proc/$pid/status" ] || continue
+              pids=$((pids + 1))
+              value="$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2>/dev/null)"
+              rss=$((rss + ${value:-0}))
+              value="$(awk '/^VmHWM:/ {print $2}' "/proc/$pid/status" 2>/dev/null)"
+              hwm=$((hwm + ${value:-0}))
+              value="$(awk '/^VmSwap:/ {print $2}' "/proc/$pid/status" 2>/dev/null)"
+              swap=$((swap + ${value:-0}))
+            done < <(pgrep -x soong_build 2>/dev/null || true)
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$phase" "$mem_avail" "$swap_free" \
+              "$rss" "$hwm" "$swap" "$pids" \
+              "$(cgroup_read memory.current)" "$(cgroup_read memory.peak)" \
+              "$(cgroup_read memory.swap.current)" "$(cgroup_read memory.swap.peak)" \
+              "$(cgroup_event_value oom)" "$(cgroup_event_value oom_kill)" \
+              >> "$SOONG_MEMORY_TSV"
+          }
           : > /tmp/rbe-test/memory-pressure.log
+          if [ -n "$CGROUP_MEMORY_DIR" ] && [ -r "$CGROUP_MEMORY_DIR/memory.events" ]; then
+            cp "$CGROUP_MEMORY_DIR/memory.events" \
+              /tmp/rbe-test/cgroup-memory-events-before-graph.txt || true
+          fi
           record_memory_pressure pre-graph
+          sample_soong_memory pre-graph
 
           # Shared supervisor for both 'nothing' and 'bacon'. It records an
           # explicit phase exit code and distinguishes disk/time stops from
@@ -948,6 +1052,16 @@ jobs:
               swap_free_kib="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
               line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID free=${free_gib}GiB mem_available=${mem_kib}KiB swap_free=${swap_free_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s"
               echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
+              sample_soong_memory "$phase"
+              # Capture the compiled binary's own Go version once it exists.
+              # A runtime compiled with Go 1.18 cannot enforce GOMEMLIMIT.
+              if [ "$phase" = build-graph ] && [ ! -s /tmp/rbe-test/soong-build-binary-go-version.txt ] \
+                 && [ -x "$ANDROID_BUILD_TOP/out/host/linux-x86/bin/soong_build" ]; then
+                if [ -x "$GO_BIN" ]; then
+                  "$GO_BIN" version -m "$ANDROID_BUILD_TOP/out/host/linux-x86/bin/soong_build" \
+                    > /tmp/rbe-test/soong-build-binary-go-version.txt 2>&1 || true
+                fi
+              fi
               # Deep samples every 30s or every 10s when RAM is under 4GiB.
               if (( sample_counter % 3 == 0 || mem_kib < 4194304 )); then
                 record_memory_pressure "$phase"
@@ -990,6 +1104,7 @@ jobs:
             if [ -s "$disk_trip" ]; then MONITORED_RC=70; fi
             if [ -s "$time_trip" ]; then MONITORED_RC=71; fi
             disk_sample "post-$phase" >/dev/null
+            sample_soong_memory "post-$phase exit=$MONITORED_RC"
             record_memory_pressure "post-$phase exit=$MONITORED_RC"
             echo "=== $phase EXIT: $MONITORED_RC ==="
           }
@@ -1160,7 +1275,29 @@ jobs:
             fi
             echo ''
             echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
-            echo "Soong memory tuning: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT}; requested swap=${SOONG_SWAP_GIB} GiB."
+            echo "Soong memory tuning requested: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT} (Go >=1.19 only); graph GOMAXPROCS=${SOONG_GRAPH_GOMAXPROCS}; swap=${SOONG_SWAP_GIB} GiB."
+            echo '### Soong Go/runtime verification'
+            if [ -s /tmp/rbe-test/soong-go-runtime.txt ]; then
+              echo '```text'
+              cat /tmp/rbe-test/soong-go-runtime.txt
+              echo '```'
+            fi
+            if [ -s /tmp/rbe-test/soong-build-binary-go-version.txt ]; then
+              echo '```text'
+              cat /tmp/rbe-test/soong-build-binary-go-version.txt
+              echo '```'
+            fi
+            if [ -s /tmp/rbe-test/soong-memory-samples.tsv ]; then
+              awk -F '\t' 'NR > 1 && NF >= 14 {
+                if($5 > maxrss) maxrss=$5;
+                if($7 > maxswap) maxswap=$7;
+                if($3 > 0 && (minram == 0 || $3 < minram)) minram=$3;
+                if($14 != "na" && $14 != "" && $14+0 > maxkill) maxkill=$14+0
+              } END {
+                printf "Peak sampled soong_build RSS: **%.2f GiB**; VmSwap: **%.2f GiB**; lowest available RAM: **%.2f GiB**.\n", maxrss/1048576, maxswap/1048576, minram/1048576;
+                printf "Maximum sampled cgroup oom_kill counter: **%d** (check baseline for changes).\n", maxkill
+              }' /tmp/rbe-test/soong-memory-samples.tsv
+            fi
             if [ -s /tmp/rbe-test/swap-status.txt ]; then
               echo '```text'
               cat /tmp/rbe-test/swap-status.txt
@@ -1368,6 +1505,13 @@ jobs:
           cat /tmp/rbe-test/swap-status.txt 2>/dev/null || true
           echo '=== MEMORY PRESSURE TAIL ==='
           tail -n 160 /tmp/rbe-test/memory-pressure.log 2>/dev/null || true
+          echo '=== SOONG GO VERSION AND ACTIVE GC LIMIT ==='
+          cat /tmp/rbe-test/soong-go-runtime.txt 2>/dev/null || true
+          cat /tmp/rbe-test/soong-build-binary-go-version.txt 2>/dev/null || true
+          echo '=== SOONG MEMORY SAMPLES TAIL ==='
+          tail -n 30 /tmp/rbe-test/soong-memory-samples.tsv 2>/dev/null || true
+          echo '=== CGROUP OOM EVENT BASELINE ==='
+          cat /tmp/rbe-test/cgroup-memory-events-before-graph.txt 2>/dev/null || true
           echo '=== SOONG GRAPH EXIT CODE ==='
           cat /tmp/rbe-test/graph-exit-code.txt 2>/dev/null || true
           echo "=== ROM ZIP FILES IF PRESENT ==="
