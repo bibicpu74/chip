@@ -45,6 +45,13 @@ jobs:
       NINJA_REMOTE_NUM_JOBS: "2"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
+      # Soong graph generation is local even with BuildBuddy RBE.
+      # Go GC is tuned for the standard ~16-GB GitHub runner.
+      SOONG_GOGC: "50"
+      SOONG_GOMEMLIMIT: "10GiB"
+      # Reserve disk-backed swap only after repo sync, when disk is measured.
+      SOONG_SWAP_GIB: "4"
+
       # GiB of available disk space (statvfs/df -B1, not rounded df -h).
       # Experimental 7-GiB floor requested for a deeper build trial.
       # Never let the free space reach zero; packaging may still need more.
@@ -594,6 +601,43 @@ jobs:
           echo "::error::BuildBuddy gRPC bridge failed to start."
           exit 1
 
+      - name: Reserve emergency swap for Soong bootstrap
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          SWAPFILE=/mnt/soong-swap
+          SWAP_GIB="${SOONG_SWAP_GIB}"
+          # Keep a 12-GiB disk reserve after allocating swap: output files
+          # still require real disk space and DISK_STOP_GIB is only 7.
+          available_bytes="$(df -B1 --output=avail /mnt | tail -n1 | tr -d ' ')"
+          required_bytes="$(( (SWAP_GIB + 12) * 1073741824 ))"
+          if (( available_bytes < required_bytes )); then
+            echo "::warning::Swap disabled: only $((available_bytes / 1073741824)) GiB free; need at least $((SWAP_GIB + 12)) GiB."
+            printf 'status=insufficient-disk\n' > /tmp/rbe-test/swap-status.txt
+          elif ! sudo fallocate -l "${SWAP_GIB}G" "$SWAPFILE"; then
+            echo '::warning::Swap preallocation failed; continuing with Go GC tuning.'
+            printf 'status=fallocate-failed\n' > /tmp/rbe-test/swap-status.txt
+            sudo rm -f "$SWAPFILE"
+          else
+            sudo chmod 600 "$SWAPFILE"
+            if sudo mkswap "$SWAPFILE" >/dev/null && sudo swapon "$SWAPFILE"; then
+              printf 'status=enabled\nsize_gib=%s\n' "$SWAP_GIB" > /tmp/rbe-test/swap-status.txt
+              echo "Enabled ${SWAP_GIB}-GiB emergency swap for memory spikes."
+            else
+              echo '::warning::swapon not permitted; continuing with Go GC tuning.'
+              printf 'status=swapon-failed\n' > /tmp/rbe-test/swap-status.txt
+              sudo swapoff "$SWAPFILE" 2>/dev/null || true
+              sudo rm -f "$SWAPFILE"
+            fi
+          fi
+          echo '=== SWAP CONFIGURATION ==='
+          cat /tmp/rbe-test/swap-status.txt
+          free -h
+          swapon --show || true
+          df -h /
+
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
         # The 320-minute job-clock guard below leaves time for cleanup/upload.
@@ -653,10 +697,22 @@ jobs:
           on_signal() {
             local signal="$1" rc="$2"
             trap - TERM INT
-            printf 'signal=%s\nstage=%s\ntimestamp=%s\n' \
+            printf 'signal=%s\nstage=%s\ntimestamp=%s\nrun_id=%s\nattempt=%s\n' \
               "$signal" "$CURRENT_STAGE" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              "${GITHUB_RUN_ID:-unknown}" "${GITHUB_RUN_ATTEMPT:-unknown}" \
               > /tmp/rbe-test/termination-signal.txt
-            echo "::error::Received $signal during $CURRENT_STAGE (possible GitHub cancellation / step timeout)." >&2
+            {
+              echo '=== SIGNAL MEMORY SNAPSHOT ==='
+              free -h
+              swapon --show || true
+              ps -eo pid,ppid,rss,stat,comm --sort=-rss | head -n 18 || true
+              if [ -r /sys/fs/cgroup/memory.events ]; then
+                echo '=== MEMORY CGROUP EVENTS ==='
+                cat /sys/fs/cgroup/memory.events
+              fi
+              grep -E '^(oom_kill|pswpin|pswpout) ' /proc/vmstat || true
+            } >> /tmp/rbe-test/memory-pressure.log 2>&1
+            echo "::error::Received $signal during $CURRENT_STAGE; SIGTERM alone cannot distinguish cancellation from resource pressure." >&2
             exit "$rc"
           }
           trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
@@ -717,6 +773,17 @@ jobs:
           fi
           export USE_CCACHE=0
           export CCACHE_DISABLE=1
+          # Soong is written in Go and runs on the runner, not BuildBuddy.
+          # A Go 1.19+ runtime honors GOMEMLIMIT as a SOFT memory limit.
+          export GOGC="$SOONG_GOGC"
+          export GOMEMLIMIT="$SOONG_GOMEMLIMIT"
+          echo "=== SOONG GO GC: GOGC=$GOGC GOMEMLIMIT=$GOMEMLIMIT ==="
+          if [ -x "$PWD/prebuilts/go/linux-x86/bin/go" ]; then
+            "$PWD/prebuilts/go/linux-x86/bin/go" version || true
+          fi
+          echo '=== SWAP ==='
+          free -h
+          swapon --show || true
           echo "=== JAVA VERSION ==="
           java -version 2>&1 || true
 
@@ -829,6 +896,25 @@ jobs:
             done < <(pgrep -P "$pid" 2>/dev/null || true)
             kill -TERM "$pid" 2>/dev/null || true
           }
+          # Capture top resident-memory processes without command-line args
+          # (which might contain credentials), plus kernel/cgroup OOM counters.
+          record_memory_pressure() {
+            local label="$1"
+            {
+              echo "=== $label $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
+              free -h
+              swapon --show || true
+              ps -eo pid,ppid,rss,stat,comm --sort=-rss | head -n 18 || true
+              [ ! -r /proc/pressure/memory ] || cat /proc/pressure/memory
+              if [ -r /sys/fs/cgroup/memory.events ]; then
+                cat /sys/fs/cgroup/memory.events
+              fi
+              grep -E '^(oom_kill|pswpin|pswpout) ' /proc/vmstat || true
+            } >> /tmp/rbe-test/memory-pressure.log 2>&1
+          }
+          : > /tmp/rbe-test/memory-pressure.log
+          record_memory_pressure pre-graph
+
           # Shared supervisor for both 'nothing' and 'bacon'. It records an
           # explicit phase exit code and distinguishes disk/time stops from
           # compiler errors; an external SIGTERM is separately captured above.
@@ -836,7 +922,7 @@ jobs:
             local phase="$1" target="$2" log_file="$3" status_file="$4"
             local disk_trip="$5" time_trip="$6"
             local available now free_gib mem_kib seconds_left last_write idle_secs
-            local line wait_rc warned=0 idle_warned=0 tick
+            local line wait_rc warned=0 idle_warned=0 tick sample_counter=0
             rm -f "$status_file" "$disk_trip" "$time_trip"
             (
               # Avoid trap messages being written into Soong's stdout.
@@ -849,7 +935,7 @@ jobs:
               exit "$rc"
             ) &
             BUILD_PID=$!
-            echo "=== $phase PID=$BUILD_PID; 30s DISK / RAM / TIME SUPERVISOR ==="
+            echo "=== $phase PID=$BUILD_PID; 10s DISK / RAM / TIME SUPERVISOR ==="
             while kill -0 "$BUILD_PID" 2>/dev/null; do
               available="$(disk_sample "$phase-sample")"
               now="$(date +%s)"
@@ -859,8 +945,14 @@ jobs:
               last_write="$(stat -c '%Y' "$log_file" 2>/dev/null || printf '%s\n' "$now")"
               idle_secs=$((now - last_write))
               if (( idle_secs < 0 )); then idle_secs=0; fi
-              line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID free=${free_gib}GiB mem_available=${mem_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s"
+              swap_free_kib="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
+              line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID free=${free_gib}GiB mem_available=${mem_kib}KiB swap_free=${swap_free_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s"
               echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
+              # Deep samples every 30s or every 10s when RAM is under 4GiB.
+              if (( sample_counter % 3 == 0 || mem_kib < 4194304 )); then
+                record_memory_pressure "$phase"
+              fi
+              sample_counter=$((sample_counter + 1))
 
               if (( available < DISK_STOP_GIB * 1073741824 )); then
                 echo "Disk safety stop in $phase: available below ${DISK_STOP_GIB} GiB" | tee "$disk_trip"
@@ -883,7 +975,7 @@ jobs:
                 ps -o pid,ppid,stat,etime,%cpu,%mem,args -p "$BUILD_PID" || true
                 idle_warned=1
               fi
-              for ((tick=0; tick<6; tick++)); do
+              for ((tick=0; tick<2; tick++)); do
                 kill -0 "$BUILD_PID" 2>/dev/null || break
                 sleep 5
               done
@@ -898,6 +990,7 @@ jobs:
             if [ -s "$disk_trip" ]; then MONITORED_RC=70; fi
             if [ -s "$time_trip" ]; then MONITORED_RC=71; fi
             disk_sample "post-$phase" >/dev/null
+            record_memory_pressure "post-$phase exit=$MONITORED_RC"
             echo "=== $phase EXIT: $MONITORED_RC ==="
           }
 
@@ -1067,6 +1160,12 @@ jobs:
             fi
             echo ''
             echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
+            echo "Soong memory tuning: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT}; requested swap=${SOONG_SWAP_GIB} GiB."
+            if [ -s /tmp/rbe-test/swap-status.txt ]; then
+              echo '```text'
+              cat /tmp/rbe-test/swap-status.txt
+              echo '```'
+            fi
             if [ -s /tmp/rbe-test/disk-stop-triggered.txt ]; then
               echo '**Guard triggered: build terminated due to low disk.**'
             fi
@@ -1265,11 +1364,29 @@ jobs:
           cat /tmp/rbe-test/*-stop-triggered.txt 2>/dev/null || true
           echo '=== EXTERNAL TERMINATION SIGNAL ==='
           cat /tmp/rbe-test/termination-signal.txt 2>/dev/null || true
+          echo '=== SOONG SWAP STATUS ==='
+          cat /tmp/rbe-test/swap-status.txt 2>/dev/null || true
+          echo '=== MEMORY PRESSURE TAIL ==='
+          tail -n 160 /tmp/rbe-test/memory-pressure.log 2>/dev/null || true
           echo '=== SOONG GRAPH EXIT CODE ==='
           cat /tmp/rbe-test/graph-exit-code.txt 2>/dev/null || true
           echo "=== ROM ZIP FILES IF PRESENT ==="
           find /home/runner/work/los/out/target/product/star2lte -maxdepth 1 \
             -type f -name 'lineage-*.zip' -printf '%p %s bytes\n' 2>/dev/null || true
+
+      - name: Release emergency Soong swap
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          SWAPFILE=/mnt/soong-swap
+          if [ -f "$SWAPFILE" ]; then
+            sudo swapoff "$SWAPFILE" 2>/dev/null || true
+            sudo rm -f "$SWAPFILE"
+          fi
+          echo '=== SWAP AFTER CLEANUP ==='
+          swapon --show || true
+          df -h /
 
       - name: Stop BuildBuddy gRPC bridge and remove credentials
         if: always()
