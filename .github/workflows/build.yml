@@ -60,6 +60,13 @@ jobs:
       # Keep 12 GiB free after graph swap allocation where possible.
       SOONG_SWAP_DISK_RESERVE_GIB: "12"
 
+      # P1 storage trim: worktree-only, measured with df before/after.
+      # Preserve Linux toolchains and Android 13 (API 33) reference ABI dumps.
+      STORAGE_TRIM_DARWIN_HOST_TOOLS: "1"
+      # Experimental: keep VNDK ABI versions 32, 33 and R; remove 29..31 only.
+      # Set to "0" to retain all VNDK reference dumps for stricter validation.
+      STORAGE_TRIM_OLD_VNDK_ABI: "1"
+
       # GiB of available disk space (statvfs/df -B1, not rounded df -h).
       # Experimental 7-GiB floor requested for a deeper build trial.
       # Never let the free space reach zero; packaging may still need more.
@@ -230,6 +237,32 @@ jobs:
           echo 'P0 trim verified: prebuilts/remoteexecution-client will NOT be repo-synced.' \
             | tee /tmp/rbe-test/p0-storage-trim-status.txt
 
+          echo '=== VERIFY STORAGE PROJECT REMOVALS (EFFECTIVE MANIFEST) ==='
+          for removed in \
+            prebuilts/clang/host/darwin-x86 \
+            prebuilts/android-emulator \
+            prebuilts/bazel/darwin-x86_64 \
+            prebuilts/go/darwin-x86; do
+            if grep -Fxq "$removed" /tmp/rbe-test/manifest-projects-after-trim.txt; then
+              echo "::error::Expected removed project is still present: $removed"
+              exit 1
+            fi
+            echo "Removed from repo sync: $removed"
+          done
+          for required in \
+            device/samsung/star2lte \
+            device/samsung/exynos9810-common \
+            device/samsung_slsi/sepolicy \
+            kernel/samsung/exynos9810 \
+            vendor/samsung/star2lte \
+            vendor/samsung/exynos9810-common \
+            hardware/samsung; do
+            if ! grep -Fxq "$required" /tmp/rbe-test/manifest-projects-after-trim.txt; then
+              echo "::error::Missing required device/vendor project: $required"
+              exit 1
+            fi
+          done
+
           echo "=== LOCAL MANIFEST ==="
           sed -n '1,260p' "$MANIFEST_DST"
           echo "=== P0 STORAGE TRIM MANIFEST ==="
@@ -388,6 +421,120 @@ jobs:
           sample post-deep-storage-profile
 
           echo '=== DEEP STORAGE BASELINE COMPLETE ==='
+
+      # P1: remove only unwanted host-platform binaries and historical
+      # ABI reference dumps from checked-out worktrees. This DOES NOT reclaim
+      # packed objects in .repo/project-objects: they remain for this run.
+      - name: P1 reclaim unused Darwin binaries and historical VNDK ABI worktrees
+        if: success()
+        working-directory: /home/runner/work/los
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT=/tmp/rbe-test/storage-trim-p1.log
+          TABLE=/tmp/rbe-test/storage-trim-p1.tsv
+          TS=/tmp/rbe-test/resource-samples.tsv
+          mkdir -p /tmp/rbe-test
+          printf 'path\tpre_kib\tstatus\n' > "$TABLE"
+          exec > >(tee "$REPORT") 2>&1
+
+          echo '=== P1 STORAGE TRIM (WORKTREE ONLY) ==='
+          echo "Darwin trimming: ${STORAGE_TRIM_DARWIN_HOST_TOOLS}"
+          echo "Historical VNDK ABI trimming: ${STORAGE_TRIM_OLD_VNDK_ABI}"
+          before_bytes="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
+          echo "disk_available_before_bytes=$before_bytes"
+
+          # Whitelist protects source and vendor trees from dynamic path input.
+          trim_known_path() {
+            local rel="$1" kib=0
+            case "$rel" in
+              prebuilts/rust/darwin-x86|prebuilts/clang-tools/darwin-x86|prebuilts/build-tools/darwin-x86|\
+              prebuilts/jdk/jdk8/darwin-x86|prebuilts/jdk/jdk9/darwin-x86|\
+              prebuilts/jdk/jdk11/darwin-x86|prebuilts/jdk/jdk17/darwin-x86|\
+              prebuilts/abi-dumps/vndk/29|prebuilts/abi-dumps/vndk/30|prebuilts/abi-dumps/vndk/31)
+                ;;
+              *) echo "::error::Refusing non-whitelisted removal: $rel"; return 2 ;;
+            esac
+            if [ -L "$rel" ]; then
+              echo "SKIP symlink $rel"
+              printf '%s\t0\tskipped-symlink\n' "$rel" >> "$TABLE"
+              return 0
+            fi
+            if [ ! -d "$rel" ]; then
+              echo "SKIP absent $rel"
+              printf '%s\t0\tabsent\n' "$rel" >> "$TABLE"
+              return 0
+            fi
+            kib="$(du -sk -- "$rel" | awk '{print $1}')"
+            echo "TRIM $rel size=$((kib / 1024)) MiB (checked-out files only)"
+            rm -rf -- "$rel"
+            if [ -e "$rel" ]; then
+              echo "::error::Failed to remove $rel"
+              return 1
+            fi
+            printf '%s\t%s\tremoved\n' "$rel" "$kib" >> "$TABLE"
+          }
+
+          if [ "${STORAGE_TRIM_DARWIN_HOST_TOOLS}" = 1 ]; then
+            # Abort the Linux-host trim if the Rust Linux toolchain is absent.
+            if [ -d prebuilts/rust/linux-x86 ] && [ -d prebuilts/clang/host/linux-x86 ]; then
+              for rel in \
+                prebuilts/rust/darwin-x86 \
+                prebuilts/clang-tools/darwin-x86 \
+                prebuilts/build-tools/darwin-x86 \
+                prebuilts/jdk/jdk8/darwin-x86 \
+                prebuilts/jdk/jdk9/darwin-x86 \
+                prebuilts/jdk/jdk11/darwin-x86 \
+                prebuilts/jdk/jdk17/darwin-x86; do
+                trim_known_path "$rel"
+              done
+            else
+              echo '::warning::Linux host toolchains not found; Darwin trim skipped for safety.'
+            fi
+          fi
+
+          if [ "${STORAGE_TRIM_OLD_VNDK_ABI}" = 1 ]; then
+            # Android 13 uses API/VNDK 33 reference dumps; keep 32 as
+            # compatibility headroom, plus 33, R, files at repository root.
+            # Do not remove the abi-dumps project or disable ABI checks.
+            root=prebuilts/abi-dumps/vndk
+            if [ ! -L "$root" ] && [ -s "$root/Android.bp" ] \
+               && [ -d "$root/32" ] && [ -d "$root/33" ]; then
+              echo 'VNDK ABI trim guard passed: versions 32 and 33 and Android.bp exist.'
+              for rel in \
+                prebuilts/abi-dumps/vndk/29 \
+                prebuilts/abi-dumps/vndk/30 \
+                prebuilts/abi-dumps/vndk/31; do
+                trim_known_path "$rel"
+              done
+            else
+              echo '::warning::VNDK ABI layout differs from Android 13 expectation; skipping ABI trim.'
+            fi
+          fi
+
+          # Strict post-checks for the host toolchain and current ABI reference.
+          test -d prebuilts/rust/linux-x86
+          test -d prebuilts/clang/host/linux-x86
+          test -d prebuilts/abi-dumps/vndk/33
+          test -d prebuilts/abi-dumps/vndk/32
+          after_bytes="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
+          reclaimed_bytes="$((after_bytes - before_bytes))"
+          echo '=== P1 STORAGE RESULT ==='
+          echo "disk_available_after_bytes=$after_bytes"
+          echo "disk_available_delta_bytes=$reclaimed_bytes"
+          df -h "$PWD"
+          cat "$TABLE"
+          if (( reclaimed_bytes < 0 )); then
+            echo '::warning::Net free space decreased during trim; check concurrent processes.'
+          fi
+          if [ -s "$TS" ]; then
+            printf '%s\tpost-worktree-trim\t%s\t%s\t%s\n' \
+              "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$after_bytes" \
+              "$(df -B1 --output=used "$PWD" | tail -n1 | tr -d ' ')" \
+              "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" >> "$TS"
+          fi
+          echo 'P1 trim changes the checkout only, not .repo Git object packs.'
 
       - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
@@ -1521,6 +1668,16 @@ jobs:
             fi
             echo 'Storage profiling did not modify source or Git objects.'
             echo ''
+            echo '### P1 host-binary / historical ABI worktree trim'
+            if [ -s /tmp/rbe-test/storage-trim-p1.log ]; then
+              echo '```text'
+              grep -E '^(TRIM |SKIP |disk_available_(before|after|delta)_bytes=|P1 trim changes)' \
+                /tmp/rbe-test/storage-trim-p1.log | tail -n 30 || true
+              echo '```'
+            else
+              echo 'P1 trim did not execute.'
+            fi
+            echo ''
             echo '### P0 reclient trim'
             if [ -s /tmp/rbe-test/p0-storage-trim-status.txt ]; then
               cat /tmp/rbe-test/p0-storage-trim-status.txt
@@ -1677,6 +1834,8 @@ jobs:
           tail -n 30 /tmp/rbe-test/soong-memory-samples.tsv 2>/dev/null || true
           echo '=== CGROUP OOM EVENT BASELINE ==='
           cat /tmp/rbe-test/cgroup-memory-events-before-graph.txt 2>/dev/null || true
+          echo '=== P1 STORAGE TRIM SUMMARY ==='
+          tail -n 50 /tmp/rbe-test/storage-trim-p1.log 2>/dev/null || true
           echo '=== SOONG GRAPH EXIT CODE ==='
           cat /tmp/rbe-test/graph-exit-code.txt 2>/dev/null || true
           echo "=== ROM ZIP FILES IF PRESENT ==="
