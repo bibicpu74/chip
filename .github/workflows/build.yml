@@ -52,8 +52,13 @@ jobs:
       SOONG_GOMEMLIMIT: "6GiB"
       # Limit active Go workers during the memory-heavy graph generation only.
       SOONG_GRAPH_GOMAXPROCS: "2"
-      # Reserve disk-backed swap only after repo sync, when disk is measured.
-      SOONG_SWAP_GIB: "4"
+      # Hybrid graph memory: compressed RAM swap first, disk swap second.
+      # ZRAM is best-effort: GitHub runner kernels may not provide the module.
+      SOONG_ZRAM_GIB: "8"
+      SOONG_DISK_SWAP_GIB: "12"
+      POST_GRAPH_DISK_SWAP_GIB: "4"
+      # Keep 12 GiB free after graph swap allocation where possible.
+      SOONG_SWAP_DISK_RESERVE_GIB: "12"
 
       # GiB of available disk space (statvfs/df -B1, not rounded df -h).
       # Experimental 7-GiB floor requested for a deeper build trial.
@@ -604,42 +609,130 @@ jobs:
           echo "::error::BuildBuddy gRPC bridge failed to start."
           exit 1
 
-      - name: Reserve emergency swap for Soong bootstrap
+      - name: Configure hybrid ZRAM and disk swap for Soong graph
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/rbe-test
-          SWAPFILE=/mnt/soong-swap
-          SWAP_GIB="${SOONG_SWAP_GIB}"
-          # Keep a 12-GiB disk reserve after allocating swap: output files
-          # still require real disk space and DISK_STOP_GIB is only 7.
-          available_bytes="$(df -B1 --output=avail /mnt | tail -n1 | tr -d ' ')"
-          required_bytes="$(( (SWAP_GIB + 12) * 1073741824 ))"
-          if (( available_bytes < required_bytes )); then
-            echo "::warning::Swap disabled: only $((available_bytes / 1073741824)) GiB free; need at least $((SWAP_GIB + 12)) GiB."
-            printf 'status=insufficient-disk\n' > /tmp/rbe-test/swap-status.txt
-          elif ! sudo fallocate -l "${SWAP_GIB}G" "$SWAPFILE"; then
-            echo '::warning::Swap preallocation failed; continuing with Go GC tuning.'
-            printf 'status=fallocate-failed\n' > /tmp/rbe-test/swap-status.txt
-            sudo rm -f "$SWAPFILE"
+          umask 077
+          ZRAM_STATUS=/tmp/rbe-test/zram-status.txt
+          DISK_STATUS=/tmp/rbe-test/swap-status.txt
+          ZRAM_DEVICE_FILE=/tmp/rbe-test/zram-device.txt
+          BASE_SWAP=/mnt/soong-swap-base
+          GRAPH_SWAP=/mnt/soong-swap-graph
+          BASE_GIB="${POST_GRAPH_DISK_SWAP_GIB}"
+          GIB=1073741824
+          : > "$ZRAM_STATUS"
+          : > "$DISK_STATUS"
+          rm -f "$ZRAM_DEVICE_FILE"
+
+          # A dedicated new device only: do not reset or alter existing swap.
+          echo '=== ZRAM CAPABILITY / SETUP ==='
+          if ! command -v zramctl >/dev/null 2>&1; then
+            printf 'status=unavailable\nreason=zramctl-not-installed\n' > "$ZRAM_STATUS"
           else
-            sudo chmod 600 "$SWAPFILE"
-            if sudo mkswap "$SWAPFILE" >/dev/null && sudo swapon "$SWAPFILE"; then
-              printf 'status=enabled\nsize_gib=%s\n' "$SWAP_GIB" > /tmp/rbe-test/swap-status.txt
-              echo "Enabled ${SWAP_GIB}-GiB emergency swap for memory spikes."
+            # It may already be built into the kernel; modprobe failure is not fatal.
+            sudo modprobe zram num_devices=1 2>>/tmp/rbe-test/zram-setup-errors.log || true
+            zram_dev=''
+            # lz4 tends to minimize CPU overhead; use kernel default if absent.
+            if zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" --algorithm lz4 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
+              zram_algorithm=lz4
+            elif zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
+              zram_algorithm=kernel-default
             else
-              echo '::warning::swapon not permitted; continuing with Go GC tuning.'
-              printf 'status=swapon-failed\n' > /tmp/rbe-test/swap-status.txt
-              sudo swapoff "$SWAPFILE" 2>/dev/null || true
-              sudo rm -f "$SWAPFILE"
+              zram_dev=''
+              zram_algorithm=unavailable
+            fi
+            if [ -n "$zram_dev" ] && [ -b "$zram_dev" ] \
+               && sudo mkswap -f "$zram_dev" >/dev/null 2>>/tmp/rbe-test/zram-setup-errors.log \
+               && sudo swapon --priority 100 "$zram_dev" 2>>/tmp/rbe-test/zram-setup-errors.log; then
+              printf '%s\n' "$zram_dev" > "$ZRAM_DEVICE_FILE"
+              printf 'status=enabled\ndevice=%s\nsize_gib=%s\nalgorithm=%s\npriority=100\n' \
+                "$zram_dev" "$SOONG_ZRAM_GIB" "$zram_algorithm" > "$ZRAM_STATUS"
+              echo "ZRAM activated: $zram_dev size=${SOONG_ZRAM_GIB}GiB algorithm=$zram_algorithm priority=100"
+            else
+              printf 'status=unavailable\nreason=kernel-or-activation-error\n' > "$ZRAM_STATUS"
+              if [ -n "$zram_dev" ]; then
+                sudo swapoff "$zram_dev" >/dev/null 2>&1 || true
+                # Only reset if not registered as active swap.
+                if ! swapon --noheadings --show=NAME | grep -Fxq "$zram_dev"; then
+                  sudo zramctl --reset "$zram_dev" >/dev/null 2>&1 || true
+                fi
+              fi
+              echo '::warning::ZRAM unavailable; continuing with disk swap fallback.'
             fi
           fi
-          echo '=== SWAP CONFIGURATION ==='
-          cat /tmp/rbe-test/swap-status.txt
+
+          # Disk-swap layout: 4-GiB baseline + 8-GiB graph-only extension.
+          # Higher priority on baseline ensures graph-only file is used last,
+          # improving the chance it is empty after the Soong process exits.
+          # Never allocate below the reserved free-space floor.
+          echo '=== DISK SWAP SIZING ==='
+          disk_free_bytes="$(df -B1 --output=avail /mnt | tail -n1 | tr -d ' ')"
+          disk_free_gib=$((disk_free_bytes / GIB))
+          reserve_gib="${SOONG_SWAP_DISK_RESERVE_GIB}"
+          target_gib="${SOONG_DISK_SWAP_GIB}"
+          if (( disk_free_bytes < (target_gib + reserve_gib) * GIB )); then
+            # A smaller fallback still respects the same reserve.
+            target_gib=$((disk_free_gib - reserve_gib))
+            if (( target_gib > SOONG_DISK_SWAP_GIB )); then target_gib="$SOONG_DISK_SWAP_GIB"; fi
+          fi
+          if (( target_gib < BASE_GIB )); then
+            echo "::warning::Not enough disk for even ${BASE_GIB}GiB swap with ${reserve_gib}GiB reserve."
+            target_gib=0
+          fi
+          printf 'status=disabled\ndisk_free_before_gib=%s\nrequested_gib=%s\nallocated_gib=0\nreserve_gib=%s\n' \
+            "$disk_free_gib" "$SOONG_DISK_SWAP_GIB" "$reserve_gib" > "$DISK_STATUS"
+          allocate_swap() {
+            local path="$1" size_gib="$2" priority="$3"
+            if ! sudo fallocate -l "${size_gib}G" "$path"; then
+              sudo rm -f "$path" || true
+              return 1
+            fi
+            sudo chmod 600 "$path"
+            if sudo mkswap "$path" >/dev/null && sudo swapon --priority "$priority" "$path"; then
+              echo "SWAP_ON path=$path size_gib=$size_gib priority=$priority"
+              return 0
+            fi
+            sudo swapoff "$path" >/dev/null 2>&1 || true
+            sudo rm -f "$path" || true
+            return 1
+          }
+          allocated=0
+          if (( target_gib >= BASE_GIB )); then
+            if allocate_swap "$BASE_SWAP" "$BASE_GIB" 20; then
+              allocated="$BASE_GIB"
+              graph_gib=$((target_gib - BASE_GIB))
+              if (( graph_gib > 0 )); then
+                if allocate_swap "$GRAPH_SWAP" "$graph_gib" 10; then
+                  allocated=$((allocated + graph_gib))
+                else
+                  echo '::warning::Graph-only swap allocation failed, base swap still enabled.'
+                fi
+              fi
+            else
+              echo '::warning::Baseline disk swap allocation failed.'
+            fi
+          fi
+          printf 'status=%s\ndisk_free_before_gib=%s\nrequested_gib=%s\nallocated_gib=%s\nreserve_gib=%s\nbase_gib=%s\n' \
+            "$( (( allocated > 0 )) && echo enabled || echo disabled)" \
+            "$disk_free_gib" "$SOONG_DISK_SWAP_GIB" "$allocated" "$reserve_gib" "$BASE_GIB" \
+            > "$DISK_STATUS"
+          if (( allocated < SOONG_DISK_SWAP_GIB )); then
+            echo "::warning::Disk swap available ${allocated}/${SOONG_DISK_SWAP_GIB} GiB (disk-reserve safeguard)."
+          fi
+          echo '=== ACTIVE HYBRID SWAP ==='
+          cat "$ZRAM_STATUS" "$DISK_STATUS"
+          swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
+          zramctl || true
           free -h
-          swapon --show || true
-          df -h /
+          df -h /mnt /home/runner/work/los
+          # Failing to activate any swap is not a successful 15-GiB trial.
+          if ! swapon --noheadings --show=NAME | grep -q .; then
+            echo '::error::No active swap device; aborting before the known Soong memory peak.'
+            exit 1
+          fi
 
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
@@ -956,6 +1049,15 @@ jobs:
               echo "=== $label $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
               free -h
               swapon --show || true
+              zramctl 2>/dev/null || true
+              if [ -r /tmp/rbe-test/zram-device.txt ]; then
+                zram_dev="$(cat /tmp/rbe-test/zram-device.txt)"
+                zram_node="${zram_dev##*/}"
+                if [ -r "/sys/block/${zram_node}/mm_stat" ]; then
+                  echo "--- ZRAM ${zram_node} MM_STAT (orig/compressed/mem_used in bytes) ---"
+                  cat "/sys/block/${zram_node}/mm_stat"
+                fi
+              fi
               echo '--- TOP RSS (KiB; command names only; no args or secrets) ---'
               ps -eo pid,ppid,rss,stat,comm --sort=-rss | head -n 18 || true
               echo '--- SOONG BUILD PROCESS DETAILS ---'
@@ -1033,6 +1135,13 @@ jobs:
               trap - ERR TERM INT
               set +e
               set -o pipefail
+              if [ "$phase" = build-graph ]; then
+                export GOMAXPROCS="$SOONG_GRAPH_GOMAXPROCS"
+                echo "=== SOONG GRAPH GO RUNTIME: GOGC=$GOGC GOMAXPROCS=$GOMAXPROCS GOMEMLIMIT=${GOMEMLIMIT:-not-supported} ==="
+              else
+                # Only graph generation uses the reduced Go CPU parallelism.
+                unset GOMAXPROCS || true
+              fi
               m -j2 --skip-soong-tests "$target" 2>&1 | tee "$log_file"
               rc=${PIPESTATUS[0]}
               printf '%s\n' "$rc" > "$status_file"
@@ -1053,6 +1162,29 @@ jobs:
               line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID free=${free_gib}GiB mem_available=${mem_kib}KiB swap_free=${swap_free_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s"
               echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
               sample_soong_memory "$phase"
+              # Live Actions log survives more cancellation scenarios than
+              # artifact upload. No arguments/credentials are printed.
+              if [ "$phase" = build-graph ]; then
+                soong_rss=0; soong_vmswap=0
+                while IFS= read -r spid; do
+                  [ -r "/proc/$spid/status" ] || continue
+                  sr="$(awk '/^VmRSS:/ {print $2}' "/proc/$spid/status" 2>/dev/null)"
+                  ss="$(awk '/^VmSwap:/ {print $2}' "/proc/$spid/status" 2>/dev/null)"
+                  soong_rss=$((soong_rss + ${sr:-0}))
+                  soong_vmswap=$((soong_vmswap + ${ss:-0}))
+                done < <(pgrep -x soong_build 2>/dev/null || true)
+                zram_used_kib=0; zram_physical_kib=0
+                if [ -s /tmp/rbe-test/zram-device.txt ]; then
+                  zram_dev="$(cat /tmp/rbe-test/zram-device.txt)"
+                  zram_node="${zram_dev##*/}"
+                  if [ -r "/sys/block/$zram_node/mm_stat" ]; then
+                    read -r z_orig z_compressed z_physical _ < "/sys/block/$zram_node/mm_stat" || true
+                    zram_used_kib=$(( ${z_orig:-0} / 1024 ))
+                    zram_physical_kib=$(( ${z_physical:-0} / 1024 ))
+                  fi
+                fi
+                echo "SOONG_MEMORY rss_kib=$soong_rss vm_swap_kib=$soong_vmswap zram_logical_kib=$zram_used_kib zram_physical_kib=$zram_physical_kib cgroup_oom_kill=$(cgroup_event_value oom_kill)"
+              fi
               # Capture the compiled binary's own Go version once it exists.
               # A runtime compiled with Go 1.18 cannot enforce GOMEMLIMIT.
               if [ "$phase" = build-graph ] && [ ! -s /tmp/rbe-test/soong-build-binary-go-version.txt ] \
@@ -1128,6 +1260,32 @@ jobs:
             echo "::error::Soong build graph failed or was stopped (exit $MONITORED_RC)."
             exit "$MONITORED_RC"
           fi
+          # Soong's Go process is now gone. Reclaim graph-only swap when
+          # ZERO pages remain allocated to that file; otherwise keep it.
+          # Attempting swapoff with populated swap can itself OOM a 15-GiB VM.
+          mark_stage post-graph-swap-reclaim
+          GRAPH_SWAP=/mnt/soong-swap-graph
+          if [ -f "$GRAPH_SWAP" ]; then
+            graph_swap_used="$(swapon --bytes --noheadings --show=NAME,USED | awk -v path="$GRAPH_SWAP" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
+            if [ "$graph_swap_used" = 0 ]; then
+              if sudo swapoff "$GRAPH_SWAP"; then
+                sudo rm -f "$GRAPH_SWAP"
+                printf 'status=reclaimed\nreason=no-swapped-pages\n' > /tmp/rbe-test/graph-swap-reclaim.txt
+                echo 'Graph-only swap was unused at graph completion; released reserved disk blocks.'
+              else
+                printf 'status=retained\nreason=swapoff-failed\n' > /tmp/rbe-test/graph-swap-reclaim.txt
+                echo '::warning::Graph-only swapoff failed; keeping active file.'
+              fi
+            else
+              printf 'status=retained\nused_bytes=%s\nreason=nonzero-pages-or-unavailable\n' \
+                "$graph_swap_used" > /tmp/rbe-test/graph-swap-reclaim.txt
+              echo "::warning::Graph swap still holds ${graph_swap_used} bytes; keep it for safety (disk capacity may restrict ROM build)."
+            fi
+          else
+            printf 'status=not-present\n' > /tmp/rbe-test/graph-swap-reclaim.txt
+          fi
+          swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
+          df -h /home/runner/work/los
           enforce_initial_disk_guard post-graph
 
           BUILD_NINJA="$ANDROID_BUILD_TOP/out/combined-${TARGET_PRODUCT}.ninja"
@@ -1275,7 +1433,8 @@ jobs:
             fi
             echo ''
             echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
-            echo "Soong memory tuning requested: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT} (Go >=1.19 only); graph GOMAXPROCS=${SOONG_GRAPH_GOMAXPROCS}; swap=${SOONG_SWAP_GIB} GiB."
+            echo "Soong: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT} (Go >=1.19 only); graph GOMAXPROCS=${SOONG_GRAPH_GOMAXPROCS}."
+            echo "Hybrid swap requested: ZRAM=${SOONG_ZRAM_GIB}GiB logical; disk=${SOONG_DISK_SWAP_GIB}GiB (post-graph base ${POST_GRAPH_DISK_SWAP_GIB}GiB)."
             echo '### Soong Go/runtime verification'
             if [ -s /tmp/rbe-test/soong-go-runtime.txt ]; then
               echo '```text'
@@ -1298,11 +1457,14 @@ jobs:
                 printf "Maximum sampled cgroup oom_kill counter: **%d** (check baseline for changes).\n", maxkill
               }' /tmp/rbe-test/soong-memory-samples.tsv
             fi
-            if [ -s /tmp/rbe-test/swap-status.txt ]; then
-              echo '```text'
-              cat /tmp/rbe-test/swap-status.txt
-              echo '```'
-            fi
+            for status in /tmp/rbe-test/zram-status.txt /tmp/rbe-test/swap-status.txt /tmp/rbe-test/graph-swap-reclaim.txt; do
+              if [ -s "$status" ]; then
+                echo '```text'
+                echo "$(basename "$status")"
+                cat "$status"
+                echo '```'
+              fi
+            done
             if [ -s /tmp/rbe-test/disk-stop-triggered.txt ]; then
               echo '**Guard triggered: build terminated due to low disk.**'
             fi
@@ -1501,8 +1663,11 @@ jobs:
           cat /tmp/rbe-test/*-stop-triggered.txt 2>/dev/null || true
           echo '=== EXTERNAL TERMINATION SIGNAL ==='
           cat /tmp/rbe-test/termination-signal.txt 2>/dev/null || true
-          echo '=== SOONG SWAP STATUS ==='
-          cat /tmp/rbe-test/swap-status.txt 2>/dev/null || true
+          echo '=== HYBRID SWAP STATUS ==='
+          cat /tmp/rbe-test/zram-status.txt /tmp/rbe-test/swap-status.txt \
+            /tmp/rbe-test/graph-swap-reclaim.txt 2>/dev/null || true
+          swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
+          zramctl || true
           echo '=== MEMORY PRESSURE TAIL ==='
           tail -n 160 /tmp/rbe-test/memory-pressure.log 2>/dev/null || true
           echo '=== SOONG GO VERSION AND ACTIVE GC LIMIT ==='
@@ -1518,17 +1683,35 @@ jobs:
           find /home/runner/work/los/out/target/product/star2lte -maxdepth 1 \
             -type f -name 'lineage-*.zip' -printf '%p %s bytes\n' 2>/dev/null || true
 
-      - name: Release emergency Soong swap
+      - name: Release hybrid swap at job end (best effort)
         if: always()
         shell: bash
         run: |
           set +e
-          SWAPFILE=/mnt/soong-swap
-          if [ -f "$SWAPFILE" ]; then
-            sudo swapoff "$SWAPFILE" 2>/dev/null || true
-            sudo rm -f "$SWAPFILE"
+          # On a canceled/low-memory runner, swapoff can allocate several GiB
+          # and trigger another OOM. Do not swapoff non-empty swap devices.
+          # Runner is ephemeral; leave in-use devices until VM teardown.
+          for SWAPFILE in /mnt/soong-swap-graph /mnt/soong-swap-base; do
+            if [ ! -f "$SWAPFILE" ]; then continue; fi
+            USED="$(swapon --bytes --noheadings --show=NAME,USED | awk -v path="$SWAPFILE" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
+            if [ "$USED" = 0 ] && sudo swapoff "$SWAPFILE"; then
+              sudo rm -f "$SWAPFILE"
+              echo "Released unused swap $SWAPFILE"
+            else
+              echo "Retained swap $SWAPFILE used_bytes=$USED (na = unknown; not unlinking)"
+            fi
+          done
+          if [ -s /tmp/rbe-test/zram-device.txt ]; then
+            ZRAM_DEV="$(cat /tmp/rbe-test/zram-device.txt)"
+            USED="$(swapon --bytes --noheadings --show=NAME,USED | awk -v path="$ZRAM_DEV" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
+            if [ "$USED" = 0 ] && sudo swapoff "$ZRAM_DEV"; then
+              sudo zramctl --reset "$ZRAM_DEV" || true
+              echo "Released unused zram $ZRAM_DEV"
+            else
+              echo "Retained zram $ZRAM_DEV used_bytes=$USED"
+            fi
           fi
-          echo '=== SWAP AFTER CLEANUP ==='
+          echo '=== SWAP AFTER SAFE CLEANUP ==='
           swapon --show || true
           df -h /
 
