@@ -1,7 +1,16 @@
-name: LineageOS 20.0 - star2lte Full ROM Trial (BuildBuddy RBE)
+name: LineageOS 20.0 - star2lte Btrfs ZSTD + RBE16 + LFS
 
 on:
   workflow_dispatch:
+    inputs:
+      workspace_storage:
+        description: "Android workspace: Btrfs ZSTD (default), or uncompressed plain"
+        type: choice
+        required: true
+        default: btrfs_zstd
+        options:
+          - btrfs_zstd
+          - plain
 
 permissions:
   contents: read
@@ -17,6 +26,8 @@ jobs:
 
     env:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
+      WORKSPACE_STORAGE: "${{ inputs.workspace_storage }}"
+      BTRFS_WORKSPACE_IMAGE_GIB: "220"
 
       # Android / Soong RBE
       USE_RBE: "1"
@@ -40,9 +51,9 @@ jobs:
       RBE_reproxy_wait_seconds: "30"
       RBE_v: "2"
 
-      # Conservative 2-job build parallelism on GitHub hosted runner.
-      # Keep memory-intensive actions serial to reduce local memory pressure.
-      NINJA_REMOTE_NUM_JOBS: "2"
+      # Android Soong uses remote Ninja concurrency independently of -j2.
+      # Keep the 2-job local pool, highmem pool=1; try up to 16 remote actions.
+      NINJA_REMOTE_NUM_JOBS: "16"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
       # Soong graph generation is local even with BuildBuddy RBE.
@@ -150,6 +161,7 @@ jobs:
             rsync \
             schedtool \
             squashfs-tools \
+            btrfs-progs \
             xsltproc \
             zip \
             zlib1g-dev \
@@ -178,6 +190,42 @@ jobs:
             exit 1
           fi
 
+      # A single filesystem for .repo, the entire Android source tree, prebuilts
+      # and out/. The sparse image is a LOGICAL cap, NOT extra physical storage.
+      # Root df, not inner Btrfs df, is the authoritative disk safety guard.
+      - name: Mount compressed Btrfs ZSTD workspace before repo sync
+        if: ${{ inputs.workspace_storage == 'btrfs_zstd' }}
+        working-directory: /home/runner/work
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE=/home/runner/work/los
+          BACKING=/tmp/los20-workspace-btrfs.img
+          mkdir -p /tmp/rbe-test "$WORKSPACE"
+          if mountpoint -q "$WORKSPACE" || [ -n "$(ls -A "$WORKSPACE")" ]; then
+            echo '::error::Android workspace must be empty before Btrfs setup.'
+            exit 1
+          fi
+          # Never fallocate the image: physical blocks must grow on demand.
+          truncate -s "${BTRFS_WORKSPACE_IMAGE_GIB}G" "$BACKING"
+          sudo mkfs.btrfs -f -m single -d single "$BACKING" \
+            > /tmp/rbe-test/btrfs-mkfs.log 2>&1
+          sudo mount -t btrfs -o loop,compress=zstd:1,noatime \
+            "$BACKING" "$WORKSPACE"
+          sudo chown "$(id -u):$(id -g)" "$WORKSPACE"
+          test "$(stat -f -c '%T' "$WORKSPACE")" = btrfs
+          echo '=== ANDROID 13 FULL WORKSPACE ZSTD ==='
+          findmnt -T "$WORKSPACE" -o SOURCE,FSTYPE,OPTIONS
+          df -hT / "$WORKSPACE"
+          du -h "$BACKING"
+          printf 'timestamp\tstage\troot_free_bytes\tbtrfs_free_bytes\timage_allocated_bytes\n' \
+            > /tmp/rbe-test/btrfs-storage-samples.tsv
+          root_free="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+          if (( root_free < DISK_STOP_GIB * 1073741824 )); then
+            echo "::error::Host root disk below ${DISK_STOP_GIB} GiB after Btrfs mount."
+            exit 70
+          fi
+
       - name: Repo init and install local manifest
         working-directory: /home/runner/work
         shell: bash
@@ -187,12 +235,20 @@ jobs:
           git config --global user.email "ci@local"
           git config --global user.name "ci"
           git config --global color.ui false
+          # Initialize filters BEFORE repo sync; LineageOS WebView uses Git LFS.
+          git lfs version
+          git lfs install --skip-repo
 
           mkdir -p /home/runner/work/los
           cd /home/runner/work/los
+          if [ "$WORKSPACE_STORAGE" = btrfs_zstd ]; then
+            mountpoint -q "$PWD" || { echo '::error::Btrfs mount missing before repo init.'; exit 1; }
+            test "$(stat -f -c '%T' "$PWD")" = btrfs
+          fi
 
           repo init \
             --depth=1 \
+            --git-lfs \
             -u https://github.com/LineageOS/android.git \
             -b lineage-20.0
 
@@ -307,6 +363,91 @@ jobs:
 
       # Collect post-sync storage attribution while the tree is still clean.
       # This is diagnostic-only and does not mutate .repo, source, or out.
+      # Prevent a tiny LFS pointer from reaching veridex as an invalid APK.
+      # Some Android 13 trees have WebView inside a parent Git project; resolve
+      # the repository root before applying the LFS include path.
+      - name: Resolve and validate Chromium WebView arm64 Git LFS
+        working-directory: /home/runner/work/los
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          LOG=/tmp/rbe-test/webview-lfs-check.log
+          APK=external/chromium-webview/prebuilt/arm64/webview.apk
+          DIR="$(dirname "$APK")"
+          {
+            echo '=== GIT LFS ==='
+            git lfs version
+            echo '=== WEBVIEW LFS PROJECTS ==='
+            repo list -a -p | grep -E '^external/chromium-webview(/|$)' || true
+          } | tee "$LOG"
+
+          # Some manifests don't contain this prebuilt at this exact path.
+          # Do not invent/download an APK from another branch in that case.
+          if [ ! -e "$APK" ]; then
+            if repo list -a -p | grep -Fxq "$DIR"; then
+              echo "::error::WebView arm64 project exists, but APK missing: $APK" | tee -a "$LOG"
+              exit 1
+            fi
+            echo "WebView APK absent at $APK; this manifest may use another WebView source." | tee -a "$LOG"
+            exit 0
+          fi
+
+          REPO_ROOT="$(git -C "$DIR" rev-parse --show-toplevel)"
+          REL_APK="$(realpath --relative-to="$REPO_ROOT" "$PWD/$APK")"
+          {
+            echo "git_root=$REPO_ROOT"
+            echo "git_relative_apk=$REL_APK"
+            echo "original_size_bytes=$(stat -c %s "$APK")"
+            git -C "$REPO_ROOT" lfs ls-files --long | grep -F 'webview.apk' || true
+          } | tee -a "$LOG"
+          if [[ "$(head -c 96 "$APK")" == 'version https://git-lfs.github.com/spec/v1'* ]]; then
+            echo 'Detected Git LFS pointer; fetching the exact checkout revision.' | tee -a "$LOG"
+            git -C "$REPO_ROOT" lfs pull --include="$REL_APK" --exclude='' \
+              2>&1 | tee /tmp/rbe-test/webview-lfs-pull.log
+            git -C "$REPO_ROOT" lfs checkout "$REL_APK" \
+              2>&1 | tee -a /tmp/rbe-test/webview-lfs-pull.log
+          fi
+          python3 - "$APK" <<'PYWEBVIEW'
+          import pathlib,sys,zipfile
+          file=pathlib.Path(sys.argv[1])
+          with file.open('rb') as f: prefix=f.read(256)
+          if prefix.startswith(b'version https://git-lfs.github.com/spec/v1'):
+              sys.exit('ERROR: WebView APK is still an LFS pointer')
+          if file.stat().st_size < 10 * 1024 * 1024 or prefix[:2] != b'PK':
+              sys.exit('ERROR: WebView prebuilt is too small or not an APK/ZIP')
+          with zipfile.ZipFile(file) as apk:
+              if 'AndroidManifest.xml' not in apk.namelist():
+                  sys.exit('ERROR: WebView APK missing AndroidManifest.xml')
+              print(f'WebView arm64 APK verified; bytes={file.stat().st_size}')
+          PYWEBVIEW
+          echo '=== WEBVIEW APK ZIP CRC CHECK ===' | tee -a "$LOG"
+          unzip -tqq "$APK" | tee /tmp/rbe-test/webview-unzip-test.txt
+          sha256sum "$APK" | tee /tmp/rbe-test/webview-sha256.txt
+          echo 'WebView LFS preflight passed.' | tee -a "$LOG"
+
+      - name: Record Btrfs workspace use after repo sync
+        if: ${{ inputs.workspace_storage == 'btrfs_zstd' }}
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          BACKING=/tmp/los20-workspace-btrfs.img
+          mountpoint -q "$PWD"
+          test "$(stat -f -c '%T' "$PWD")" = btrfs
+          echo '=== WORKSPACE AFTER SYNC ==='
+          df -hT / "$PWD"
+          stat -c 'image_size_bytes=%s image_allocated_blocks=%b block_bytes=%B' "$BACKING"
+          sudo btrfs filesystem usage -b "$PWD" \
+            > /tmp/rbe-test/btrfs-post-sync-usage.txt 2>&1 || true
+          root_avail="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+          inner_avail="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
+          if (( root_avail < DISK_STOP_GIB * 1073741824 || inner_avail < DISK_STOP_GIB * 1073741824 )); then
+            echo '::error::Disk low after repo sync, before Android build.'
+            exit 70
+          fi
+
       - name: Profile storage after repo sync
         if: success()
         working-directory: /home/runner/work/los
@@ -1164,6 +1305,9 @@ jobs:
             echo "RBE_v=${RBE_v}"
             echo "RBE_output_dir=${RBE_output_dir}"
             echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
+            echo "NINJA_HIGHMEM_NUM_JOBS=${NINJA_HIGHMEM_NUM_JOBS}"
+            echo "NINJA_LOCAL_PARALLEL=2"
+            echo "WORKSPACE_STORAGE=${WORKSPACE_STORAGE}"
           } | tee /tmp/rbe-test/rbe-env.txt
 
           # Write stage-specific samples for easy comparison, using bytes
@@ -1172,13 +1316,33 @@ jobs:
           if [ ! -f "$DISK_SAMPLES" ]; then
             printf 'timestamp\tstage\tdisk_available_bytes\tdisk_used_bytes\tmem_available_kib\n' > "$DISK_SAMPLES"
           fi
+          # Btrfs loop-image logical capacity is NOT host free space.
+          # Both root and inner Btrfs are checked, and the smaller governs.
+          BTRFS_ACTIVE=0
+          BTRFS_BACKING=/tmp/los20-workspace-btrfs.img
+          if [ "$WORKSPACE_STORAGE" = btrfs_zstd ]; then
+            mountpoint -q "$PWD" || { echo '::error::Btrfs mount lost'; exit 70; }
+            test "$(stat -f -c '%T' "$PWD")" = btrfs
+            test -f "$BTRFS_BACKING"
+            BTRFS_ACTIVE=1
+          fi
           disk_sample() {
-            local stage="$1" available used mem
-            available="$(df -B1 --output=avail "$PWD" | tail -n 1 | tr -d ' ')"
-            used="$(df -B1 --output=used "$PWD" | tail -n 1 | tr -d ' ')"
+            local stage="$1" root_avail root_used inner_avail available mem alloc blocks bsize
+            root_avail="$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')"
+            root_used="$(df -B1 --output=used / | tail -n 1 | tr -d ' ')"
+            inner_avail="$(df -B1 --output=avail "$PWD" | tail -n 1 | tr -d ' ')"
+            available="$root_avail"
+            if (( inner_avail < available )); then available="$inner_avail"; fi
             mem="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
             printf '%s\t%s\t%s\t%s\t%s\n' \
-              "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$stage" "$available" "$used" "$mem" >> "$DISK_SAMPLES"
+              "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$stage" "$available" "$root_used" "$mem" >> "$DISK_SAMPLES"
+            if (( BTRFS_ACTIVE == 1 )); then
+              read -r blocks bsize < <(stat -c '%b %B' "$BTRFS_BACKING")
+              alloc=$((blocks*bsize))
+              printf '%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$stage" "$root_avail" "$inner_avail" "$alloc" \
+                >> /tmp/rbe-test/btrfs-storage-samples.tsv
+            fi
             printf '%s\n' "$available"
           }
           enforce_initial_disk_guard() {
@@ -1186,11 +1350,11 @@ jobs:
             available="$(disk_sample "$stage")"
             threshold=$((DISK_STOP_GIB * 1024 * 1024 * 1024))
             if (( available < threshold )); then
-              echo "::error::Available disk below ${DISK_STOP_GIB} GiB at ${stage}; refusing to start/continue build."
-              df -h /home/runner/work/los
-              exit 1
+              echo "::error::Root/Btrfs available below ${DISK_STOP_GIB} GiB at ${stage}."
+              df -h / "$PWD"
+              exit 70
             fi
-            echo "=== DISK AT ${stage}: $((available / 1073741824)) GiB free ==="
+            echo "=== DISK AT ${stage}: $((available / 1073741824)) GiB physical-safe free ==="
           }
           # The 320-minute deadline is measured from post-reclaim, not from
           # the start of bacon. Supervise Soong graph generation as well.
@@ -1362,7 +1526,12 @@ jobs:
               idle_secs=$((now - last_write))
               if (( idle_secs < 0 )); then idle_secs=0; fi
               swap_free_kib="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
-              line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID free=${free_gib}GiB mem_available=${mem_kib}KiB swap_free=${swap_free_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s"
+              line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID disk_safe_free=${free_gib}GiB mem_available=${mem_kib}KiB swap_free=${swap_free_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s"
+              if (( BTRFS_ACTIVE == 1 )); then
+                root_now="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+                inner_now="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
+                line="$line host_free_gib=$((root_now / 1073741824)) btrfs_free_gib=$((inner_now / 1073741824))"
+              fi
               echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
               sample_soong_memory "$phase"
               # Live Actions log survives more cancellation scenarios than
@@ -1473,7 +1642,7 @@ jobs:
           RECLAIM_STATUS=/tmp/rbe-test/graph-swap-reclaim.txt
           MAX_RECLAIM_USED_BYTES=$((256 * 1024 * 1024))
           MIN_RAM_MARGIN_BYTES=$((2 * 1024 * 1024 * 1024))
-          free_disk_before="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
+          free_disk_before="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
           graph_swap_used='na'
           reclaim_reason='not-present'
           reclaim_result='retained'
@@ -1513,7 +1682,7 @@ jobs:
               fi
             fi
           fi
-          free_disk_after="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
+          free_disk_after="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
           freed_disk_bytes=$((free_disk_after - free_disk_before))
           {
             printf 'status=%s\nreason=%s\nused_bytes=%s\n' \
@@ -1673,6 +1842,19 @@ jobs:
             fi
             echo ''
             echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
+            echo "Workspace: **${WORKSPACE_STORAGE}**; Ninja remote=${NINJA_REMOTE_NUM_JOBS}, local=2, highmem=${NINJA_HIGHMEM_NUM_JOBS}."
+            if [ -s /tmp/rbe-test/btrfs-storage-samples.tsv ]; then
+              echo '### Btrfs ZSTD host/root accounting'
+              echo '```text'
+              tail -n 8 /tmp/rbe-test/btrfs-storage-samples.tsv
+              echo '```'
+            fi
+            if [ -s /tmp/rbe-test/webview-lfs-check.log ]; then
+              echo '### WebView LFS validation'
+              echo '```text'
+              tail -n 15 /tmp/rbe-test/webview-lfs-check.log
+              echo '```'
+            fi
             echo "Soong: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT} (Go >=1.19 only); graph GOMAXPROCS=${SOONG_GRAPH_GOMAXPROCS}."
             echo "Hybrid swap requested: ZRAM=${SOONG_ZRAM_GIB}GiB logical; disk=${SOONG_DISK_SWAP_GIB}GiB (post-graph base ${POST_GRAPH_DISK_SWAP_GIB}GiB)."
             echo '### Soong Go/runtime verification'
@@ -2011,3 +2193,25 @@ jobs:
             /home/runner/work/los/.repo/repo.log
           if-no-files-found: warn
           retention-days: 7
+
+      # Always run AFTER ROM and diagnostic uploads; keep mount live for upload.
+      - name: Unmount compressed workspace (best effort)
+        if: ${{ always() && inputs.workspace_storage == 'btrfs_zstd' }}
+        shell: bash
+        run: |
+          set +e
+          WORKSPACE=/home/runner/work/los
+          BACKING=/tmp/los20-workspace-btrfs.img
+          echo '=== BTRFS FINAL PHYSICAL USAGE ==='
+          df -hT / "$WORKSPACE"
+          du -h "$BACKING" 2>/dev/null || true
+          sync
+          if mountpoint -q "$WORKSPACE"; then
+            sudo umount "$WORKSPACE"
+          fi
+          if ! mountpoint -q "$WORKSPACE"; then
+            rm -f -- "$BACKING"
+            echo 'Btrfs workspace detached; backing image removed.'
+          else
+            echo '::warning::Btrfs mount busy; leaving image to runner teardown.'
+          fi
