@@ -569,6 +569,62 @@ jobs:
       # Reclient 0.25 (2021) predates the Remote Execution API fix for
       # working-directory-relative output paths (SDK fix Nov 2021).
       # Pin a coherent prebuilt release rather than mixing rewrapper/reproxy.
+      # Ubuntu 24.04 ships ncurses6; legacy RenderScript Clang needs ncurses5.
+      # Use the matching Jammy security packages, pinned with checksums from
+      # packages.ubuntu.com, instead of making unsafe SONAME symlinks.
+      - name: Install and verify legacy ncurses5 for RenderScript
+        working-directory: /home/runner/work/los
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          LOG=/tmp/rbe-test/legacy-ncurses5-check.log
+          exec > >(tee "$LOG") 2>&1
+
+          VERSION=6.3-2ubuntu0.3
+          BASE=https://security.ubuntu.com/ubuntu/pool/universe/n/ncurses
+          PKG_DIR="$RUNNER_TEMP/ncurses5-jammy"
+          mkdir -p "$PKG_DIR"
+          # SHA256 hashes published by Ubuntu for the amd64 .deb files.
+          NCURSES_SHA=58da01991712c6856af0658dc5e9cb533c1a6854ab950055ade185e35bc9c276
+          TINFO_SHA=4df4288404108f1a156d014e8764a064e977e34e6d44931ab60451694c03c90d
+
+          for pkg in libtinfo5 libncurses5; do
+            file="${pkg}_${VERSION}_amd64.deb"
+            curl --fail --location --show-error --silent \
+              --retry 3 --connect-timeout 15 --max-time 90 \
+              "$BASE/$file" -o "$PKG_DIR/$file"
+            test "$(dpkg-deb -f "$PKG_DIR/$file" Package)" = "$pkg"
+            test "$(dpkg-deb -f "$PKG_DIR/$file" Version)" = "$VERSION"
+            test "$(dpkg-deb -f "$PKG_DIR/$file" Architecture)" = amd64
+          done
+          printf '%s  %s\n' \
+            "$TINFO_SHA" "$PKG_DIR/libtinfo5_${VERSION}_amd64.deb" \
+            "$NCURSES_SHA" "$PKG_DIR/libncurses5_${VERSION}_amd64.deb" \
+            | sha256sum --check --status
+          echo '=== SHA256 checks passed (Ubuntu Jammy security) ==='
+
+          sudo dpkg -i \
+            "$PKG_DIR/libtinfo5_${VERSION}_amd64.deb" \
+            "$PKG_DIR/libncurses5_${VERSION}_amd64.deb"
+          sudo ldconfig
+          ldconfig -p | grep -F 'libtinfo.so.5'
+          ldconfig -p | grep -F 'libncurses.so.5'
+          echo '=== LEGACY RENDERSCRIPT CLANG DEPENDENCIES ==='
+          CLANG=prebuilts/clang/host/linux-x86/clang-3289846/bin/clang.real
+          if [ ! -x "$CLANG" ]; then
+            echo "::error::Expected legacy RenderScript Clang missing: $CLANG"
+            exit 1
+          fi
+          ldd "$CLANG" | tee /tmp/rbe-test/legacy-clang-ldd.txt
+          if grep -q 'not found' /tmp/rbe-test/legacy-clang-ldd.txt; then
+            echo '::error::Legacy RenderScript Clang still has unresolved shared libraries.'
+            exit 1
+          fi
+          "$CLANG" --version
+          echo '=== LEGACY RENDERSCRIPT CLANG PREFLIGHT PASSED ==='
+
       - name: Install compatible reclient 0.57.0 (pinned AOSP)
         working-directory: /home/runner/work/los
         timeout-minutes: 20
@@ -1407,29 +1463,66 @@ jobs:
             echo "::error::Soong build graph failed or was stopped (exit $MONITORED_RC)."
             exit "$MONITORED_RC"
           fi
-          # Soong's Go process is now gone. Reclaim graph-only swap when
-          # ZERO pages remain allocated to that file; otherwise keep it.
-          # Attempting swapoff with populated swap can itself OOM a 15-GiB VM.
+          # Soong's memory-heavy graph is complete. The prior run left only
+          # ~19 MiB used inside the 8-GiB graph-only swap file, but did not
+          # reclaim it because usage was nonzero. Evict tiny amounts safely.
+          # Never swapoff large/populated swap or unlink an active swap file.
           mark_stage post-graph-swap-reclaim
           GRAPH_SWAP=/mnt/soong-swap-graph
+          BASE_SWAP=/mnt/soong-swap-base
+          RECLAIM_STATUS=/tmp/rbe-test/graph-swap-reclaim.txt
+          MAX_RECLAIM_USED_BYTES=$((256 * 1024 * 1024))
+          MIN_RAM_MARGIN_BYTES=$((2 * 1024 * 1024 * 1024))
+          free_disk_before="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
+          graph_swap_used='na'
+          reclaim_reason='not-present'
+          reclaim_result='retained'
           if [ -f "$GRAPH_SWAP" ]; then
-            graph_swap_used="$(swapon --bytes --noheadings --show=NAME,USED | awk -v path="$GRAPH_SWAP" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
-            if [ "$graph_swap_used" = 0 ]; then
-              if sudo swapoff "$GRAPH_SWAP"; then
-                sudo rm -f "$GRAPH_SWAP"
-                printf 'status=reclaimed\nreason=no-swapped-pages\n' > /tmp/rbe-test/graph-swap-reclaim.txt
-                echo 'Graph-only swap was unused at graph completion; released reserved disk blocks.'
-              else
-                printf 'status=retained\nreason=swapoff-failed\n' > /tmp/rbe-test/graph-swap-reclaim.txt
-                echo '::warning::Graph-only swapoff failed; keeping active file.'
-              fi
+            graph_swap_used="$(swapon --bytes --noheadings --show=NAME,USED \
+              | awk -v path="$GRAPH_SWAP" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
+            mem_available_bytes="$(awk '/^MemAvailable:/ {printf "%.0f", $2 * 1024}' /proc/meminfo)"
+            echo "=== GRAPH SWAP RECLAIM PRECHECK: used=${graph_swap_used}B mem_available=${mem_available_bytes}B ==="
+            swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
+            if [[ ! "$graph_swap_used" =~ ^[0-9]+$ ]]; then
+              reclaim_reason='swap-not-active-or-usage-unknown'
+            elif ! swapon --noheadings --show=NAME | grep -Fxq "$BASE_SWAP"; then
+              reclaim_reason='baseline-swap-not-active'
+            elif pgrep -x soong_build >/dev/null 2>&1; then
+              reclaim_reason='soong-still-running'
+            elif (( graph_swap_used > MAX_RECLAIM_USED_BYTES )); then
+              reclaim_reason='more-than-256MiB-swapped'
+            elif (( mem_available_bytes < graph_swap_used + MIN_RAM_MARGIN_BYTES )); then
+              reclaim_reason='insufficient-RAM-margin'
             else
-              printf 'status=retained\nused_bytes=%s\nreason=nonzero-pages-or-unavailable\n' \
-                "$graph_swap_used" > /tmp/rbe-test/graph-swap-reclaim.txt
-              echo "::warning::Graph swap still holds ${graph_swap_used} bytes; keep it for safety (disk capacity may restrict ROM build)."
+              # 90-second cap avoids unbounded stalls; swapoff remains best effort.
+              # If interrupted or unsuccessful, the file is preserved.
+              if sudo timeout --signal=TERM --kill-after=10s 90s swapoff "$GRAPH_SWAP"; then
+                reclaim_rc=0
+              else
+                reclaim_rc=$?
+              fi
+              if (( reclaim_rc == 0 )) \
+                 && ! swapon --noheadings --show=NAME | grep -Fxq "$GRAPH_SWAP"; then
+                sudo rm -f -- "$GRAPH_SWAP"
+                reclaim_result='reclaimed'
+                reclaim_reason='swapoff-success'
+                echo 'Graph-only swap deactivated and unlinked after safety checks.'
+              else
+                reclaim_reason="swapoff-failed-or-timeout-rc-${reclaim_rc}"
+                echo "::warning::Swapoff did not safely complete (rc=$reclaim_rc); retained graph swap file."
+              fi
             fi
-          else
-            printf 'status=not-present\n' > /tmp/rbe-test/graph-swap-reclaim.txt
+          fi
+          free_disk_after="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
+          freed_disk_bytes=$((free_disk_after - free_disk_before))
+          {
+            printf 'status=%s\nreason=%s\nused_bytes=%s\n' \
+              "$reclaim_result" "$reclaim_reason" "$graph_swap_used"
+            printf 'disk_free_before_bytes=%s\ndisk_free_after_bytes=%s\nreclaimed_disk_bytes=%s\n' \
+              "$free_disk_before" "$free_disk_after" "$freed_disk_bytes"
+          } | tee "$RECLAIM_STATUS"
+          if [ "$reclaim_result" != reclaimed ]; then
+            echo "::warning::Graph-only swap retained: $reclaim_reason. The 8-GiB file may constrain the ROM build."
           fi
           swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
           df -h /home/runner/work/los
