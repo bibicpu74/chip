@@ -1,4 +1,4 @@
-name: LineageOS 20.0 - star2lte Btrfs ZSTD + RBE16 + LFS
+name: LineageOS 20.0 - star2lte P4 RBE fallback + libvpx preflight
 
 on:
   workflow_dispatch:
@@ -32,7 +32,9 @@ jobs:
       # Android / Soong RBE
       USE_RBE: "1"
       RBE_DIR: "prebuilts/remoteexecution-client/live"
-      RBE_CXX_EXEC_STRATEGY: "remote"
+      # P4: remote first, then local on remote action failure.
+      # Avoid global local/racing mode, preserving the existing 16 remote slots.
+      RBE_CXX_EXEC_STRATEGY: "remote_local_fallback"
 
       # The legacy reclient used by this pipeline cannot attach RBE_remote_headers.
       # Forward plaintext h2c on loopback to a TLS-verified nginx gRPC proxy
@@ -1749,9 +1751,75 @@ jobs:
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/reproxy"
 
+          # P4: Verify the actual generated Ninja command uses fallback. The
+          # workflow env alone is not proof: Soong may override the strategy.
+          mark_stage verify-rbe-fallback
+          FALLBACK_LOG=/tmp/rbe-test/rbe-fallback-preflight.log
+          {
+            echo '=== P4 GENERATED RBE CXX STRATEGY ==='
+            echo "requested=$RBE_CXX_EXEC_STRATEGY"
+            if [ -s "$ANDROID_BUILD_TOP/out/soong/build.ninja" ]; then
+              grep -a -m 2 -E 'g\.android\.soong\.cc\.config\.CcWrapper|--exec_strategy=remote_local_fallback' \
+                "$ANDROID_BUILD_TOP/out/soong/build.ninja" | cut -c 1-1200 || true
+            fi
+          } | tee "$FALLBACK_LOG"
+          if ! grep -aFq -- '--exec_strategy=remote_local_fallback' \
+                "$ANDROID_BUILD_TOP/out/soong/build.ninja"; then
+            echo '::error::Generated Soong Ninja graph is NOT using remote_local_fallback.' | tee -a "$FALLBACK_LOG"
+            echo '::error::Check whether Soong overwrote RBE_CXX_EXEC_STRATEGY.'
+            exit 1
+          fi
+          echo 'P4 generated rewrapper strategy verified.' | tee -a "$FALLBACK_LOG"
+
+          # Probe the exact libvpx ARM assembly inputs that failed remotely in
+          # run 38088007886. A missing file in the LOCAL tree is a source-sync
+          # issue, not something remote fallback can repair.
+          mark_stage preflight-libvpx-asm
+          LIBVPX_LOG=/tmp/rbe-test/libvpx-asm-preflight.log
+          LIBVPX_CLANG=prebuilts/clang/host/linux-x86/clang-r450784d/bin/clang
+          LIBVPX_OUT=/tmp/rbe-test/libvpx-asm-preflight
+          mkdir -p "$LIBVPX_OUT"
+          {
+            echo '=== P4 LIBVPX ASSEMBLY INPUTS ==='
+            echo "clang=$LIBVPX_CLANG"
+            for file in \
+              external/libvpx/config/arm-neon/vpx_dsp/arm/idct4x4_add_neon.asm.S \
+              external/libvpx/config/arm-neon/vpx_dsp/arm/idct_neon.asm.S \
+              external/libvpx/libvpx/vpx_dsp/arm/idct_neon.asm.S \
+              external/libvpx/config/arm-neon/vpx_config.asm; do
+              if [ ! -s "$file" ]; then
+                echo "MISSING: $file"
+                exit 1
+              fi
+              ls -lh "$file"
+            done
+            test -x "$LIBVPX_CLANG" || { echo "MISSING COMPILER: $LIBVPX_CLANG"; exit 1; }
+            "$LIBVPX_CLANG" --version | head -2
+            echo '=== COMPILE LOCAL LIBVPX ASM SMOKE TEST ==='
+            for src in \
+              external/libvpx/config/arm-neon/vpx_dsp/arm/idct4x4_add_neon.asm.S \
+              external/libvpx/config/arm-neon/vpx_dsp/arm/idct_neon.asm.S; do
+              dest="$LIBVPX_OUT/$(basename "$src").o"
+              echo "source=$src output=$dest"
+              timeout 90 "$LIBVPX_CLANG" \
+                -target armv7a-linux-androideabi29 \
+                -march=armv8-a -mfpu=neon-fp-armv8 \
+                -D__ASSEMBLY__ -D__ANDROID_VNDK__ -D__ANDROID_VENDOR__ \
+                -Iexternal/libvpx/libvpx \
+                -Iexternal/libvpx/config/arm-neon \
+                -Iexternal/libvpx \
+                -c "$src" -o "$dest" || exit 1
+              test -s "$dest" || { echo "EMPTY OBJECT: $dest"; exit 1; }
+              ls -lh "$dest"
+            done
+            echo 'PASS: both libvpx ARM asm sources compile locally.'
+          } 2>&1 | tee "$LIBVPX_LOG"
+          # With pipefail enabled, any failure above stops the job BEFORE bacon.
+          # The smoke outputs are isolated under /tmp and never alter Ninja out/.
+
           mark_stage pre-build
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
-          echo "RBE remote-only enabled; jobs=2, highmem=1, no local ccache."
+          echo "RBE remote_local_fallback enabled; local jobs=2, remote jobs=${NINJA_REMOTE_NUM_JOBS}, highmem=1."
           echo "The previous libbase test passed; this run compiles and packages the full ROM."
           enforce_initial_disk_guard pre-build
 
