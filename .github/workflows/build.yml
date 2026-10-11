@@ -1,4 +1,4 @@
-name: LineageOS 20.0 - star2lte P5 compressed RBE logs + storage profiling
+name: LineageOS 20.0 - star2lte P6 extended deadline + Ninja throughput
 
 on:
   workflow_dispatch:
@@ -56,7 +56,10 @@ jobs:
       RBE_v: "0"
       # No RBE_log_path, and no forced log_format for legacy reclient 0.57.
       # Diagnostic snapshots run infrequently so they do not slow the build.
-      P5_STORAGE_SAMPLE_INTERVAL_SECONDS: "600"
+      # P6: reduce heavy directory walks from 10 to 30 minutes.
+      P5_STORAGE_SAMPLE_INTERVAL_SECONDS: "1800"
+      # P6: very cheap bounded-tail Ninja throughput samples every 5 minutes.
+      P6_NINJA_SAMPLE_INTERVAL_SECONDS: "300"
 
       # Android Soong uses remote Ninja concurrency independently of -j2.
       # Keep the 2-job local pool, highmem pool=1; try up to 16 remote actions.
@@ -92,7 +95,9 @@ jobs:
       DISK_STOP_GIB: "7"
       # Stop the long build early enough to upload logs and a successful ROM.
       # Whole-job limit on GitHub-hosted runners: 360 minutes.
-      FULL_ROM_SOFT_DEADLINE_MINUTES: "320"
+      # P6: reserve 15 minutes under the 360-minute job cap for artifacts.
+      # Starts at initial disk reclaim (before repo sync / graph).
+      FULL_ROM_SOFT_DEADLINE_MINUTES: "345"
 
     steps:
       - name: Reclaim root disk
@@ -1147,10 +1152,72 @@ jobs:
             > /tmp/rbe-test/p5-storage-profile.tsv
           timeout 30s /tmp/rbe-test/p5-storage-probe.sh before-graph || true
 
+          # P6: parse at most the final 256 KiB of the build log, no 'grep'
+          # of multi-GiB logs and no expensive output directory traversal.
+          # Called by the existing 10-second supervisor every five minutes.
+          cat > /tmp/rbe-test/p6-ninja-sample.py <<'P6NINJA'
+          #!/usr/bin/env python3
+          import datetime
+          import pathlib
+          import re
+          import sys
+          import time
+
+          log = pathlib.Path(sys.argv[1])
+          phase_started = int(sys.argv[2])
+          out = pathlib.Path('/tmp/rbe-test/p6-ninja-throughput.tsv')
+          now = int(time.time())
+          try:
+              with log.open('rb') as f:
+                  f.seek(0, 2)
+                  size = f.tell()
+                  f.seek(max(0, size - 256 * 1024))
+                  tail = f.read()
+          except OSError as exc:
+              print(f'P6_NINJA_SAMPLE unavailable: {exc}', flush=True)
+              sys.exit(0)
+
+          # AOSP Ninja progress: '[ 98% 144293/145862] ...'. The action
+          # counter is not weighted by time; this measures throughput only.
+          matches = list(re.finditer(rb'\[\s*\d{1,3}%\s+(\d+)/(\d+)\]', tail))
+          if not matches:
+              print('P6_NINJA_SAMPLE no progress marker in bounded log tail', flush=True)
+              sys.exit(0)
+          completed, total = map(int, matches[-1].groups())
+          if total <= 0 or completed > total:
+              print('P6_NINJA_SAMPLE invalid Ninja progress data', flush=True)
+              sys.exit(0)
+
+          prior_count, prior_epoch = 0, phase_started
+          if out.is_file():
+              for line in out.read_text(encoding='utf-8').splitlines()[1:]:
+                  fields = line.split('\t')
+                  if len(fields) >= 4:
+                      try:
+                          prior_epoch, prior_count = int(fields[1]), int(fields[2])
+                      except ValueError:
+                          continue
+          if completed < prior_count:
+              print('P6_NINJA_SAMPLE counter moved backward; skipping', flush=True)
+              sys.exit(0)
+          window_seconds = max(1, now - prior_epoch)
+          delta = completed - prior_count
+          rate = 60.0 * delta / window_seconds
+          elapsed = max(0, now - phase_started)
+          stamp = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+          if not out.is_file():
+              out.write_text('timestamp_utc\tepoch\tcompleted\ttotal\tpercent\tdelta_actions\twindow_seconds\tactions_per_min\tbuild_elapsed_minutes\tremaining_actions\n', encoding='utf-8')
+          with out.open('a', encoding='utf-8') as f:
+              f.write(f'{stamp}\t{now}\t{completed}\t{total}\t{completed*100/total:.2f}\t{delta}\t{window_seconds}\t{rate:.2f}\t{elapsed/60:.1f}\t{total-completed}\n')
+          print(f'P6_NINJA_SAMPLE {stamp} completed={completed}/{total} percent={completed*100/total:.2f} delta={delta} window_s={window_seconds} actions_per_min={rate:.2f} remaining={total-completed}', flush=True)
+          P6NINJA
+          chmod +x /tmp/rbe-test/p6-ninja-sample.py
+
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
-        # The 320-minute job-clock guard below leaves time for cleanup/upload.
-        timeout-minutes: 325
+        # P6: step timeout is secondary to the whole-job 345-minute guard.
+        # 350 minutes is the maximum step duration, not an additional budget.
+        timeout-minutes: 350
         shell: bash
         run: |
           set -eo pipefail
@@ -1202,7 +1269,8 @@ jobs:
               echo '=== FAILURE DISK / MEMORY SNAPSHOT ==='
               df -h /home/runner/work/los || true
               free -h || true
-              du -sh out 2>/dev/null || true
+              # P6: avoid a deep uncapped walk while stopping near deadline.
+              timeout 10s du -sh out 2>/dev/null || true
             else
               printf 'exit_code=0\nstage=%s\n' "$CURRENT_STAGE" \
                 > /tmp/rbe-test/configure-success.txt
@@ -1571,6 +1639,9 @@ jobs:
             local available now free_gib mem_kib seconds_left last_write idle_secs
             local line wait_rc warned=0 idle_warned=0 tick sample_counter=0
             local p5_probe_pid='' p5_probe_ticks=0
+            local p6_ninja_last_epoch p6_ninja_started_epoch
+            p6_ninja_started_epoch="$(date +%s)"
+            p6_ninja_last_epoch="$p6_ninja_started_epoch"
             rm -f "$status_file" "$disk_trip" "$time_trip"
             (
               # Avoid trap messages being written into Soong's stdout.
@@ -1646,9 +1717,9 @@ jobs:
                 record_memory_pressure "$phase"
               fi
               sample_counter=$((sample_counter + 1))
-              # P5.2: inexpensive root/image data is sampled every 10 seconds;
-              # scanning out/ is limited to every 10 minutes and runs in the
-              # background with a 40-second maximum. Disk guard never waits.
+              # P6: root/image data is sampled every 10 seconds; deep 'du'
+              # scans happen only every 30 minutes with a 40-second cap.
+              # Disk/time guards never wait for a directory scan.
               p5_probe_ticks=$((p5_probe_ticks + 1))
               if (( p5_probe_ticks * 10 >= P5_STORAGE_SAMPLE_INTERVAL_SECONDS )); then
                 p5_probe_ticks=0
@@ -1656,6 +1727,17 @@ jobs:
                   (timeout 40s /tmp/rbe-test/p5-storage-probe.sh "$phase" || true) \
                     >> /tmp/rbe-test/p5-storage-probe.log 2>&1 &
                   p5_probe_pid=$!
+                fi
+              fi
+
+              # P6: Ninja throughput from the last 256 KiB of the local log.
+              # Does not scan source/out or read the entire build log.
+              if [ "$phase" = full-rom-build ] && \
+                 (( now - p6_ninja_last_epoch >= P6_NINJA_SAMPLE_INTERVAL_SECONDS )); then
+                p6_ninja_last_epoch="$now"
+                if [ -x /tmp/rbe-test/p6-ninja-sample.py ]; then
+                  python3 /tmp/rbe-test/p6-ninja-sample.py "$log_file" "$p6_ninja_started_epoch" \
+                    | tee -a /tmp/rbe-test/p6-ninja-sample.log || true
                 fi
               fi
 
@@ -1691,6 +1773,11 @@ jobs:
             set -e
             BUILD_PID=''
             MONITORED_RC="$wait_rc"
+            # P6 final checkpoint: record end progress even on time/disk stop.
+            if [ "$phase" = full-rom-build ] && [ -x /tmp/rbe-test/p6-ninja-sample.py ]; then
+              python3 /tmp/rbe-test/p6-ninja-sample.py "$log_file" "$p6_ninja_started_epoch" \
+                | tee -a /tmp/rbe-test/p6-ninja-sample.log || true
+            fi
             if [ -s "$status_file" ]; then MONITORED_RC="$(cat "$status_file")"; fi
             if [ -s "$disk_trip" ]; then MONITORED_RC=70; fi
             if [ -s "$time_trip" ]; then MONITORED_RC=71; fi
@@ -2098,6 +2185,7 @@ jobs:
             echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
             echo "Workspace: **${WORKSPACE_STORAGE}**; Ninja remote=${NINJA_REMOTE_NUM_JOBS}, local=2, highmem=${NINJA_HIGHMEM_NUM_JOBS}."
             echo 'P5: legacy RBE_log_path removed; verbose=0; app/records under workspace compression (when Btrfs is selected).'
+            echo "P6: whole-job guard=${FULL_ROM_SOFT_DEADLINE_MINUTES}m / 360m; deep storage=${P5_STORAGE_SAMPLE_INTERVAL_SECONDS}s; Ninja throughput=${P6_NINJA_SAMPLE_INTERVAL_SECONDS}s."
             if [ -s /tmp/rbe-test/p5-storage-profile.tsv ]; then
               echo ''
               echo '### P5 storage footprint (most recent samples; bytes)'
@@ -2111,8 +2199,17 @@ jobs:
               tail -n 8 /tmp/rbe-test/btrfs-storage-samples.tsv
               echo '```'
             fi
+            if [ -s /tmp/rbe-test/p6-ninja-throughput.tsv ]; then
+              echo ''
+              echo '### P6 Ninja throughput (last 8 checkpoints)'
+              echo 'Actions per minute are raw Ninja action counts, not time-weighted progress.'
+              echo '```text'
+              tail -n 9 /tmp/rbe-test/p6-ninja-throughput.tsv
+              echo '```'
+            fi
             if [ -s /tmp/rbe-test/webview-lfs-check.log ]; then
               echo '### WebView LFS validation'
+
               echo '```text'
               tail -n 15 /tmp/rbe-test/webview-lfs-check.log
               echo '```'
