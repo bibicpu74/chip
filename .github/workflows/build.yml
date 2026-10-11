@@ -1,4 +1,4 @@
-name: LineageOS 20.0 - star2lte P4 RBE fallback + libvpx preflight
+name: LineageOS 20.0 - star2lte P4.1 RBE fallback + corrected libvpx preflight
 
 on:
   workflow_dispatch:
@@ -1771,51 +1771,150 @@ jobs:
           fi
           echo 'P4 generated rewrapper strategy verified.' | tee -a "$FALLBACK_LOG"
 
-          # Probe the exact libvpx ARM assembly inputs that failed remotely in
-          # run 38088007886. A missing file in the LOCAL tree is a source-sync
-          # issue, not something remote fallback can repair.
+          # P4.1: The P4 preflight incorrectly expected libvpx/libvpx/vpx_dsp/arm
+          # even though the generated arm-neon sources are under config/arm-neon.
+          # Extract the ACTUAL Clang commands from the already-generated Ninja
+          # graph and execute them LOCALLY with isolated outputs. This checks
+          # the same flags/includes as bacon, without invoking rewrapper or
+          # writing any object into out/soong.
+          # Missing Ninja targets/tool introspection are logged as SKIPPED (not
+          # a missing-source failure); only an actual failing local Clang action
+          # blocks the ROM build.
           mark_stage preflight-libvpx-asm
           LIBVPX_LOG=/tmp/rbe-test/libvpx-asm-preflight.log
-          LIBVPX_CLANG=prebuilts/clang/host/linux-x86/clang-r450784d/bin/clang
           LIBVPX_OUT=/tmp/rbe-test/libvpx-asm-preflight
           mkdir -p "$LIBVPX_OUT"
           {
-            echo '=== P4 LIBVPX ASSEMBLY INPUTS ==='
-            echo "clang=$LIBVPX_CLANG"
-            for file in \
-              external/libvpx/config/arm-neon/vpx_dsp/arm/idct4x4_add_neon.asm.S \
-              external/libvpx/config/arm-neon/vpx_dsp/arm/idct_neon.asm.S \
-              external/libvpx/libvpx/vpx_dsp/arm/idct_neon.asm.S \
-              external/libvpx/config/arm-neon/vpx_config.asm; do
-              if [ ! -s "$file" ]; then
-                echo "MISSING: $file"
-                exit 1
-              fi
-              ls -lh "$file"
-            done
-            test -x "$LIBVPX_CLANG" || { echo "MISSING COMPILER: $LIBVPX_CLANG"; exit 1; }
-            "$LIBVPX_CLANG" --version | head -2
-            echo '=== COMPILE LOCAL LIBVPX ASM SMOKE TEST ==='
-            for src in \
-              external/libvpx/config/arm-neon/vpx_dsp/arm/idct4x4_add_neon.asm.S \
-              external/libvpx/config/arm-neon/vpx_dsp/arm/idct_neon.asm.S; do
-              dest="$LIBVPX_OUT/$(basename "$src").o"
-              echo "source=$src output=$dest"
-              timeout 90 "$LIBVPX_CLANG" \
-                -target armv7a-linux-androideabi29 \
-                -march=armv8-a -mfpu=neon-fp-armv8 \
-                -D__ASSEMBLY__ -D__ANDROID_VNDK__ -D__ANDROID_VENDOR__ \
-                -Iexternal/libvpx/libvpx \
-                -Iexternal/libvpx/config/arm-neon \
-                -Iexternal/libvpx \
-                -c "$src" -o "$dest" || exit 1
-              test -s "$dest" || { echo "EMPTY OBJECT: $dest"; exit 1; }
-              ls -lh "$dest"
-            done
-            echo 'PASS: both libvpx ARM asm sources compile locally.'
+            python3 - "$BUILD_NINJA" "$LIBVPX_OUT" <<'PYLIBVPXP41'
+          import os
+          import re
+          import shlex
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          graph = Path(sys.argv[1])
+          output_dir = Path(sys.argv[2]).resolve()
+          output_dir.mkdir(parents=True, exist_ok=True)
+          ninja = shutil.which('ninja')
+          names = ('idct4x4_add_neon.asm', 'idct_neon.asm')
+          prefix = 'out/soong/.intermediates/external/libvpx/libvpx/'
+          path_marker = '/obj/external/libvpx/config/arm-neon/vpx_dsp/arm/'
+          source_dir = Path('external/libvpx/config/arm-neon/vpx_dsp/arm')
+          config_asm = Path('external/libvpx/config/arm-neon/vpx_config.asm')
+
+          print('=== P4.1 LIBVPX PRE-FLIGHT FROM ACTUAL NINJA COMMANDS ===', flush=True)
+          print(f'graph={graph}', flush=True)
+          print(f'ninja={ninja or "unavailable"}', flush=True)
+          print(f'output_dir={output_dir}', flush=True)
+          if not graph.is_file() or not ninja:
+              print('::warning::SKIPPED: Ninja graph/tool unavailable; bacon will perform the compile.', flush=True)
+              sys.exit(0)
+
+          # Stream target discovery so this large Android graph is not loaded
+          # into Python memory. Prefer the vendor ARM variant seen in P3.
+          found = {}
+          try:
+              with subprocess.Popen(
+                  ['timeout', '100', ninja, '-f', str(graph), '-t', 'targets', 'all'],
+                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                  text=True, errors='replace') as proc:
+                  for line in proc.stdout:
+                      target = line.split(': ', 1)[0]
+                      if not target.startswith(prefix) or path_marker not in target:
+                          continue
+                      variant = target.split(path_marker, 1)[0]
+                      bucket = found.setdefault(variant, {})
+                      for name in names:
+                          if target.endswith('/' + name + '.o'):
+                              bucket[name] = target
+                  status = proc.wait()
+          except (OSError, subprocess.SubprocessError) as exc:
+              print(f'::warning::SKIPPED: Ninja target discovery unavailable: {exc}', flush=True)
+              sys.exit(0)
+          if status != 0:
+              print(f'::warning::SKIPPED: Ninja target discovery exited {status}', flush=True)
+              sys.exit(0)
+
+          viable = [(v, group) for v, group in found.items() if len(group) == len(names)]
+          if not viable:
+              print('::warning::SKIPPED: No matching pair of libvpx arm-neon Ninja outputs; not assuming a source path.', flush=True)
+              sys.exit(0)
+          # Deterministic choice: prefer android_vendor ARM build; otherwise
+          # choose any matching pair from the generated graph.
+          viable.sort(key=lambda item: (0 if '/android_vendor.' in item[0] else 1, item[0]))
+          variant, targets = viable[0]
+          print(f'ninja_variant={variant}', flush=True)
+          print(f'matching_variants={len(viable)}', flush=True)
+          for name in names:
+              path = source_dir / (name + '.S')
+              if not path.is_file() or path.stat().st_size == 0:
+                  sys.exit(f'ERROR: source referenced by Ninja is missing or empty: {path}')
+              print(f'source={path} size={path.stat().st_size}', flush=True)
+          if not config_asm.is_file() or config_asm.stat().st_size == 0:
+              sys.exit(f'ERROR: ARM configuration include is missing: {config_asm}')
+          print(f'config_include={config_asm}', flush=True)
+
+          for name in names:
+              target = targets[name]
+              source = (source_dir / (name + '.S')).as_posix()
+              print(f'=== EXTRACT LOCAL ACTION: {target} ===', flush=True)
+              try:
+                  result = subprocess.run(
+                      ['timeout', '100', ninja, '-f', str(graph), '-t', 'commands', target],
+                      capture_output=True, text=True, errors='replace', timeout=110)
+              except (OSError, subprocess.SubprocessError) as exc:
+                  print(f'::warning::SKIPPED source={source}: Ninja command lookup error: {exc}', flush=True)
+                  continue
+              if result.returncode != 0:
+                  print(f'::warning::SKIPPED source={source}: Ninja commands returned {result.returncode}: {result.stderr[-800:]}', flush=True)
+                  continue
+              selected = None
+              for raw in result.stdout.splitlines():
+                  if source not in raw or 'rewrapper' not in raw:
+                      continue
+                  try:
+                      tokens = shlex.split(raw)
+                  except ValueError:
+                      continue
+                  idx = next((i for i, x in enumerate(tokens) if re.search(r'/bin/clang(?:\.real)?$', x)), None)
+                  if idx is None:
+                      continue
+                  cmd = tokens[idx:]
+                  if source in cmd and '-c' in cmd and '-o' in cmd:
+                      selected = cmd
+              if selected is None:
+                  print(f'::warning::SKIPPED source={source}: no parseable Clang action; bacon will use Ninja.', flush=True)
+                  continue
+              executable = Path(selected[0])
+              if not executable.is_file():
+                  sys.exit(f'ERROR: Ninja Clang executable missing: {executable}')
+              dest = output_dir / (name + '.o')
+              depfile = output_dir / (name + '.d')
+              cmd = list(selected)
+              cmd[cmd.index('-o') + 1] = str(dest)
+              if '-MF' in cmd:
+                  cmd[cmd.index('-MF') + 1] = str(depfile)
+              # The command is retrieved from Ninja, not guessed by this script;
+              # local execution intentionally bypasses rewrapper.
+              print('local_command=' + shlex.join(cmd), flush=True)
+              try:
+                  run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, errors='replace', timeout=120)
+              except subprocess.TimeoutExpired:
+                  sys.exit(f'ERROR: local Clang preflight timed out: {source}')
+              print(run.stdout[-12000:], flush=True)
+              if run.returncode != 0:
+                  sys.exit(f'ERROR: local Clang failed rc={run.returncode} source={source}')
+              if not dest.is_file() or dest.stat().st_size == 0:
+                  sys.exit(f'ERROR: Clang returned success without object: {dest}')
+              print(f'PASS: {source} -> {dest} ({dest.stat().st_size} bytes)', flush=True)
+          print('P4.1 preflight finished; full ROM build may proceed.', flush=True)
+          PYLIBVPXP41
           } 2>&1 | tee "$LIBVPX_LOG"
-          # With pipefail enabled, any failure above stops the job BEFORE bacon.
-          # The smoke outputs are isolated under /tmp and never alter Ninja out/.
+          # All preflight output stays under /tmp; no generated Ninja target
+          # is modified. pipefail propagates genuine local Clang failures.
 
           mark_stage pre-build
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
