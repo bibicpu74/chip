@@ -1,4 +1,4 @@
-name: LineageOS 20.0 - star2lte P4.1 RBE fallback + corrected libvpx preflight
+name: LineageOS 20.0 - star2lte P5 compressed RBE logs + storage profiling
 
 on:
   workflow_dispatch:
@@ -45,13 +45,18 @@ jobs:
       RBE_use_application_default_credentials: "false"
       RBE_use_rpc_credentials: "false"
 
-      # Keep all RBE diagnostics in one place.
-      RBE_log_dir: "/tmp/rbe-test"
-      RBE_log_path: "text:///tmp/rbe-test/reproxy_log.txt"
-      RBE_proxy_log_dir: "/tmp/rbe-test"
+      # P5.1: do not create the deprecated second execution-record stream.
+      # Keep large reproxy application and execution logs inside the workspace:
+      # Btrfs ZSTD compresses them in the default workflow mode.
+      # Metrics remain OUTSIDE the workspace for small artifact uploads.
+      RBE_log_dir: "/home/runner/work/los/.ci-rbe-logs/app"
+      RBE_proxy_log_dir: "/home/runner/work/los/.ci-rbe-logs/records"
       RBE_output_dir: "/tmp/rbe-test"
       RBE_reproxy_wait_seconds: "30"
-      RBE_v: "2"
+      RBE_v: "0"
+      # No RBE_log_path, and no forced log_format for legacy reclient 0.57.
+      # Diagnostic snapshots run infrequently so they do not slow the build.
+      P5_STORAGE_SAMPLE_INTERVAL_SECONDS: "600"
 
       # Android Soong uses remote Ninja concurrency independently of -j2.
       # Keep the 2-job local pool, highmem pool=1; try up to 16 remote actions.
@@ -1080,6 +1085,68 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare compact reproxy logging and storage probe
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test "$RBE_log_dir" "$RBE_proxy_log_dir" "$RBE_output_dir"
+          if [ "$WORKSPACE_STORAGE" = btrfs_zstd ]; then
+            test "$(stat -f -c %T "$RBE_log_dir")" = btrfs
+            test "$(stat -f -c %T "$RBE_proxy_log_dir")" = btrfs
+          fi
+          # Reclient should not create an extra deprecated text:// record stream.
+          if env | grep -q '^RBE_log_path='; then
+            echo '::error::Deprecated RBE_log_path must not be configured.'
+            exit 1
+          fi
+          echo "P5 RBE app logs: $RBE_log_dir"
+          echo "P5 RBE action records: $RBE_proxy_log_dir"
+          echo "P5 RBE metrics: $RBE_output_dir"
+          echo "P5 RBE verbose level: $RBE_v"
+          # The probe is read-only and time-limited by its caller. It NEVER
+          # removes or rewrites build intermediates, records or the Btrfs image.
+          cat > /tmp/rbe-test/p5-storage-probe.sh <<'P5PROBE'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          stage="${1:-unknown}"
+          stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          root_free="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+          inner_free="$(df -B1 --output=avail /home/runner/work/los | tail -n1 | tr -d ' ')"
+          allocated=0
+          backing=/tmp/los20-workspace-btrfs.img
+          if [ -f "$backing" ]; then
+            read -r blocks blocksize < <(stat -c '%b %B' "$backing")
+            allocated=$((blocks * blocksize))
+          fi
+          disk_bytes() {
+            local directory="$1" value
+            if [ -d "$directory" ]; then
+              value="$(du -sxB1 "$directory" 2>/dev/null | awk 'NR==1 {print $1}')"
+              printf '%s' "${value:-NA}"
+            else
+              printf '0'
+            fi
+          }
+          app_bytes="$(disk_bytes "${RBE_log_dir:-/nonexistent}")"
+          records_bytes="$(disk_bytes "${RBE_proxy_log_dir:-/nonexistent}")"
+          soong_bytes="$(disk_bytes /home/runner/work/los/out/soong)"
+          target_bytes="$(disk_bytes /home/runner/work/los/out/target)"
+          host_bytes="$(disk_bytes /home/runner/work/los/out/host)"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$stamp" "$stage" "$root_free" "$inner_free" "$allocated" \
+            "$app_bytes" "$records_bytes" "$soong_bytes" "$target_bytes" "$host_bytes" \
+            >> /tmp/rbe-test/p5-storage-profile.tsv
+          printf 'P5_STORAGE stage=%s host_free_gib=%s image_alloc_gib=%s rbe_app_mib=%s rbe_records_mib=%s out_soong_gib=%s out_target_gib=%s\n' \
+            "$stage" "$((root_free/1073741824))" "$((allocated/1073741824))" \
+            "$(( ${app_bytes//NA/0} /1048576))" "$(( ${records_bytes//NA/0} /1048576))" \
+            "$(( ${soong_bytes//NA/0} /1073741824))" "$(( ${target_bytes//NA/0} /1073741824))"
+          P5PROBE
+          chmod +x /tmp/rbe-test/p5-storage-probe.sh
+          printf 'timestamp\tphase\troot_free_bytes\tworkspace_free_bytes\timage_alloc_bytes\trbe_app_du_bytes\trbe_records_du_bytes\tout_soong_du_bytes\tout_target_du_bytes\tout_host_du_bytes\n' \
+            > /tmp/rbe-test/p5-storage-profile.tsv
+          timeout 30s /tmp/rbe-test/p5-storage-probe.sh before-graph || true
+
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
         # The 320-minute job-clock guard below leaves time for cleanup/upload.
@@ -1112,6 +1179,11 @@ jobs:
           on_exit() {
             local rc=$?
             trap - EXIT
+            # Best-effort footprint sample even when the disk guard stops ROM.
+            if [ -x /tmp/rbe-test/p5-storage-probe.sh ]; then
+              timeout 40s /tmp/rbe-test/p5-storage-probe.sh "exit-${CURRENT_STAGE}" \
+                >> /tmp/rbe-test/p5-storage-probe.log 2>&1 || true
+            fi
             # Retain the original process-tree cleanup if build is interrupted.
             if [ -n "${BUILD_PID:-}" ] && kill -0 "$BUILD_PID" 2>/dev/null; then
               if declare -F stop_process_tree >/dev/null; then
@@ -1302,7 +1374,7 @@ jobs:
             echo "RBE_service_no_auth=${RBE_service_no_auth}"
             echo "BuildBuddy auth=loopback nginx gRPC bridge (TLS upstream)"
             echo "RBE_log_dir=${RBE_log_dir}"
-            echo "RBE_log_path=${RBE_log_path}"
+            echo "RBE_log_path=DISABLED (deprecated duplicate records)"
             echo "RBE_proxy_log_dir=${RBE_proxy_log_dir}"
             echo "RBE_v=${RBE_v}"
             echo "RBE_output_dir=${RBE_output_dir}"
@@ -1498,6 +1570,7 @@ jobs:
             local disk_trip="$5" time_trip="$6"
             local available now free_gib mem_kib seconds_left last_write idle_secs
             local line wait_rc warned=0 idle_warned=0 tick sample_counter=0
+            local p5_probe_pid='' p5_probe_ticks=0
             rm -f "$status_file" "$disk_trip" "$time_trip"
             (
               # Avoid trap messages being written into Soong's stdout.
@@ -1573,6 +1646,18 @@ jobs:
                 record_memory_pressure "$phase"
               fi
               sample_counter=$((sample_counter + 1))
+              # P5.2: inexpensive root/image data is sampled every 10 seconds;
+              # scanning out/ is limited to every 10 minutes and runs in the
+              # background with a 40-second maximum. Disk guard never waits.
+              p5_probe_ticks=$((p5_probe_ticks + 1))
+              if (( p5_probe_ticks * 10 >= P5_STORAGE_SAMPLE_INTERVAL_SECONDS )); then
+                p5_probe_ticks=0
+                if [ -z "$p5_probe_pid" ] || ! kill -0 "$p5_probe_pid" 2>/dev/null; then
+                  (timeout 40s /tmp/rbe-test/p5-storage-probe.sh "$phase" || true) \
+                    >> /tmp/rbe-test/p5-storage-probe.log 2>&1 &
+                  p5_probe_pid=$!
+                fi
+              fi
 
               if (( available < DISK_STOP_GIB * 1073741824 )); then
                 echo "Disk safety stop in $phase: available below ${DISK_STOP_GIB} GiB" | tee "$disk_trip"
@@ -1697,6 +1782,8 @@ jobs:
           fi
           swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
           df -h /home/runner/work/los
+          timeout 40s /tmp/rbe-test/p5-storage-probe.sh after-graph \
+            >> /tmp/rbe-test/p5-storage-probe.log 2>&1 || true
           enforce_initial_disk_guard post-graph
 
           BUILD_NINJA="$ANDROID_BUILD_TOP/out/combined-${TARGET_PRODUCT}.ninja"
@@ -2010,6 +2097,14 @@ jobs:
             echo ''
             echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
             echo "Workspace: **${WORKSPACE_STORAGE}**; Ninja remote=${NINJA_REMOTE_NUM_JOBS}, local=2, highmem=${NINJA_HIGHMEM_NUM_JOBS}."
+            echo 'P5: legacy RBE_log_path removed; verbose=0; app/records under workspace compression (when Btrfs is selected).'
+            if [ -s /tmp/rbe-test/p5-storage-profile.tsv ]; then
+              echo ''
+              echo '### P5 storage footprint (most recent samples; bytes)'
+              echo '```text'
+              tail -n 6 /tmp/rbe-test/p5-storage-profile.tsv
+              echo '```'
+            fi
             if [ -s /tmp/rbe-test/btrfs-storage-samples.tsv ]; then
               echo '### Btrfs ZSTD host/root accounting'
               echo '```text'
@@ -2234,8 +2329,12 @@ jobs:
           echo '=== PREBUILTS MANIFEST PROJECT COUNT ==='
           wc -l /tmp/rbe-test/prebuilts-projects.log 2>/dev/null || true
 
-          echo "=== REPROXY LOG TAIL ==="
-          tail -n 220 /tmp/rbe-test/reproxy_log.txt 2>/dev/null || true
+          echo "=== P5 RBE WARNING/ERROR TAIL (CAPPED) ==="
+          tail -n 150 /tmp/rbe-test/p5-rbe-warning-tail.txt 2>/dev/null || true
+          echo '=== P5 RBE LOG FOOTPRINT ==='
+          cat /tmp/rbe-test/p5-rbe-log-footprint.txt 2>/dev/null || true
+          echo '=== P5 STORAGE PROFILE LAST 12 ROWS ==='
+          tail -n 12 /tmp/rbe-test/p5-storage-profile.tsv 2>/dev/null || true
 
           echo "=== ALL AVAILABLE RECLIENT LOGS ==="
           find /tmp/rbe-test -maxdepth 3 -type f \
@@ -2283,6 +2382,55 @@ jobs:
           echo "=== ROM ZIP FILES IF PRESENT ==="
           find /home/runner/work/los/out/target/product/star2lte -maxdepth 1 \
             -type f -name 'lineage-*.zip' -printf '%p %s bytes\n' 2>/dev/null || true
+
+      - name: Snapshot P5 RBE log footprint and largest build outputs
+        if: always()
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /tmp/rbe-test
+          if [ -x /tmp/rbe-test/p5-storage-probe.sh ]; then
+            timeout 45s /tmp/rbe-test/p5-storage-probe.sh final \
+              >> /tmp/rbe-test/p5-storage-probe.log 2>&1 || true
+          fi
+          {
+            echo '=== P5 LOG FILE INVENTORY (FILE SIZES ONLY; NO CONTENT) ==='
+            # Do not scan all of .repo or copy multi-GiB action records.
+            for dir in "$RBE_log_dir" "$RBE_proxy_log_dir"; do
+              if [ -d "$dir" ]; then
+                echo "directory=$dir"
+                find "$dir" -maxdepth 1 -type f -printf '%s bytes %f\n' \
+                  2>/dev/null | sort -nr | head -30
+                find "$dir" -maxdepth 1 -type l -printf 'symlink %f\n' \
+                  2>/dev/null | head -20
+              fi
+            done
+            echo '=== BTRFS IMAGE PHYSICAL SPACE ==='
+            stat -c 'image_blocks=%b block_bytes=%B logical_bytes=%s' \
+              /tmp/los20-workspace-btrfs.img 2>/dev/null || true
+            df -hT / /home/runner/work/los
+          } > /tmp/rbe-test/p5-rbe-log-footprint.txt 2>&1
+          # Keep only a small error/warning tail in diagnostics. The original
+          # multi-GiB INFO/RPL/rrpl files stay OUT of the uploaded artifact.
+          : > /tmp/rbe-test/p5-rbe-warning-tail.txt
+          if [ -d "$RBE_log_dir" ]; then
+            while IFS= read -r -d '' file; do
+              echo "=== $(basename "$file") ===" >> /tmp/rbe-test/p5-rbe-warning-tail.txt
+              tail -n 150 -- "$file" >> /tmp/rbe-test/p5-rbe-warning-tail.txt 2>&1
+            done < <(find "$RBE_log_dir" -maxdepth 1 -type f \
+              \( -name '*.WARNING*' -o -name '*.ERROR*' \) -print0 2>/dev/null)
+          fi
+          echo '=== LARGEST OUT/SOONG CHILDREN (READ ONLY; 45s CAP) ===' \
+            > /tmp/rbe-test/p5-out-soong-top.txt
+          timeout 45s du -xB1 -d 1 /home/runner/work/los/out/soong \
+            >> /tmp/rbe-test/p5-out-soong-top.txt 2>&1 || true
+          echo '=== LARGE OUTPUT FILES >= 512 MiB (READ ONLY; 45s CAP) ===' \
+            > /tmp/rbe-test/p5-large-output-files.txt
+          timeout 45s find /home/runner/work/los/out -xdev -type f \
+            -size +512M -printf '%s bytes %p\n' \
+            >> /tmp/rbe-test/p5-large-output-files.txt 2>&1 || true
+          echo 'P5 diagnostics: metric sizes preserved; no live RBE logs or build outputs were deleted.'
 
       - name: Release hybrid swap at job end (best effort)
         if: always()
