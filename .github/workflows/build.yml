@@ -1,4 +1,4 @@
-name: LineageOS 20.0 - star2lte P7 safe disk headroom + final packaging
+name: LineageOS 20.0 - star2lte P8 Btrfs ZSTD3 + measured compression
 
 on:
   workflow_dispatch:
@@ -28,6 +28,17 @@ jobs:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
       WORKSPACE_STORAGE: "${{ inputs.workspace_storage }}"
       BTRFS_WORKSPACE_IMAGE_GIB: "220"
+      # P8: compress the complete workspace from the first repo write.
+      BTRFS_ZSTD_LEVEL: "3"
+      # Benchmark identical built .o files at three levels ONCE during bacon.
+      P8_BENCH_ENABLED: "1"
+      P8_BENCH_START_PERCENT: "30"
+      P8_BENCH_MIN_FREE_GIB: "25"
+      P8_BENCH_TIMEOUT_SECONDS: "210"
+      # Lightweight process snapshots once Ninja is nearly complete.
+      P8_FINAL_SNAPSHOT_PERCENT: "99.90"
+      P8_FINAL_SNAPSHOT_FREE_GIB: "12"
+      P8_FINAL_SNAPSHOT_INTERVAL_SECONDS: "180"
 
       # Android / Soong RBE
       USE_RBE: "1"
@@ -201,6 +212,9 @@ jobs:
             -o "$HOME/bin/repo"
           chmod a+x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
+          # Optional metrics only: never abort ROM build if unavailable.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y btrfs-compsize \
+            || echo "::warning::Optional compsize package unavailable."
 
       # P7: remove only explicitly unused host-side runtimes.  This runs
       # after checkout and apt install but BEFORE sync/mount/build; tooling
@@ -304,10 +318,13 @@ jobs:
           truncate -s "${BTRFS_WORKSPACE_IMAGE_GIB}G" "$BACKING"
           sudo mkfs.btrfs -f -m single -d single "$BACKING" \
             > /tmp/rbe-test/btrfs-mkfs.log 2>&1
-          sudo mount -t btrfs -o loop,compress=zstd:1,noatime \
+          # Never use compress-force on full build output: preserve CPU budget.
+          sudo mount -t btrfs -o "loop,compress=zstd:${BTRFS_ZSTD_LEVEL},noatime" \
             "$BACKING" "$WORKSPACE"
           sudo chown "$(id -u):$(id -g)" "$WORKSPACE"
           test "$(stat -f -c '%T' "$WORKSPACE")" = btrfs
+          echo "P8 workspace compression: Btrfs ZSTD:${BTRFS_ZSTD_LEVEL} (no compress-force)" \
+            | tee /tmp/rbe-test/p8-compression-config.txt
           echo '=== ANDROID 13 FULL WORKSPACE ZSTD ==='
           findmnt -T "$WORKSPACE" -o SOURCE,FSTYPE,OPTIONS
           df -hT / "$WORKSPACE"
@@ -1396,6 +1413,154 @@ jobs:
           P7SWAP
           chmod +x /tmp/rbe-test/p7-base-swap-reclaim.sh
 
+      # P8 instrumentation remains outside the workspace and does NOT mutate
+      # generated Android objects or the Soong build graph.
+      - name: Prepare P8 bounded ZSTD benchmark and final-task snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          cat > /tmp/rbe-test/p8-benchmark.sh <<'P8BENCH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          LOG=/tmp/rbe-test/p8-compression-benchmark.log
+          TSV=/tmp/rbe-test/p8-compression-benchmark.tsv
+          STATUS=/tmp/rbe-test/p8-benchmark-status.txt
+          WORK=/tmp/p8-zstd-benchmark
+          SAMPLE="$WORK/sample"
+          MOUNT="$WORK/mount"
+          IMAGE="$WORK/comparison.img"
+          mkdir -p /tmp/rbe-test
+          exec 9>/tmp/rbe-test/p8-benchmark.lock
+          flock -n 9 || exit 0
+          status=skipped
+          reason=not-started
+          mounted=0
+          cleanup() {
+            local rc=$?
+            if (( mounted == 1 )); then sudo umount "$MOUNT" >/dev/null 2>&1 || true; fi
+            if mountpoint -q "$MOUNT"; then sudo umount -l "$MOUNT" >/dev/null 2>&1 || true; fi
+            rm -rf -- "$WORK" || true
+            if (( rc != 0 )) && [[ "$status" != completed ]]; then status=failed; reason="exit-$rc"; fi
+            printf 'status=%s\nreason=%s\n' "$status" "$reason" > "$STATUS"
+            echo "P8_BENCH status=$status reason=$reason"
+          }
+          trap cleanup EXIT
+          trap 'exit 124' TERM INT
+          mkdir -p /tmp/rbe-test "$SAMPLE" "$MOUNT"
+          printf 'level\tsample_files\tsample_logical_bytes\timage_base_alloc_bytes\timage_after_alloc_bytes\tadditional_alloc_bytes\tcopy_and_flush_ms\tverified_equal\n' > "$TSV"
+          if [[ "${WORKSPACE_STORAGE:-plain}" != btrfs_zstd ]]; then reason=plain-workspace; exit 0; fi
+          if ! command -v compsize >/dev/null 2>&1; then
+            echo 'compsize unavailable; physical allocation comparison still runs.' >> "$LOG"
+          fi
+          free_bytes=$(df -B1 --output=avail / | tail -n1 | tr -d ' ')
+          if (( free_bytes < ${P8_BENCH_MIN_FREE_GIB:-25} * 1073741824 )); then reason=low-host-disk; exit 0; fi
+          # Sample 128 stable, already-built .o files, <=96 MiB total.  Avoid a
+          # heavyweight sort over the entire .intermediates tree while Ninja is live.
+          # Give sampling a firm 35s cap; a missing sample is never a ROM failure.
+          if ! timeout 35s python3 - "$SAMPLE" <<'P8SAMPLE'
+          from pathlib import Path
+          import os, shutil, sys
+          root=Path('out/soong/.intermediates'); dest=Path(sys.argv[1]); count=0; total=0
+          max_total=96*1024*1024
+          if not root.is_dir(): sys.exit(2)
+          for directory, dirs, filenames in os.walk(root):
+              dirs.sort()
+              for name in sorted(filenames):
+                  if not name.endswith('.o'): continue
+                  src=Path(directory)/name
+                  try: st=src.stat()
+                  except OSError: continue
+                  if st.st_size < 64*1024 or st.st_size > 8*1024*1024 or total + st.st_size > max_total: continue
+                  dst=dest/f'{count:04d}.o'
+                  try:
+                      shutil.copyfile(src,dst)
+                      if dst.stat().st_size != st.st_size:
+                          dst.unlink(missing_ok=True); continue
+                  except OSError:
+                      dst.unlink(missing_ok=True); continue
+                  count+=1; total+=st.st_size
+                  if count >= 128 or total >= 80*1024*1024: break
+              if count >= 128 or total >= 80*1024*1024: break
+          print(f'sample_count={count} sample_bytes={total}',flush=True)
+          sys.exit(0 if count>=16 and total>=12*1024*1024 else 3)
+          P8SAMPLE
+          then reason=insufficient-or-unstable-object-sample; exit 0; fi
+          count=$(find "$SAMPLE" -maxdepth 1 -type f -name '*.o' | wc -l)
+          sample_bytes=$(du -sb "$SAMPLE" | awk '{print $1}')
+          echo "P8 SAMPLE: count=$count size=$sample_bytes" | tee "$LOG"
+          # A single 768 MiB SPARSE image reused across levels; never allocate all
+          # three images at once or expose logical image size as disk savings.
+          for level in 1 3 5; do
+            free_bytes=$(df -B1 --output=avail / | tail -n1 | tr -d ' ')
+            if (( free_bytes < ${P8_BENCH_MIN_FREE_GIB:-25} * 1073741824 )); then
+              echo "SKIP LEVEL $level: disk headroom insufficient" | tee -a "$LOG"
+              status=partial; reason=low-disk-mid-benchmark; break
+            fi
+            truncate -s 768M "$IMAGE"
+            sudo mkfs.btrfs -f -m single -d single "$IMAGE" >> "$LOG" 2>&1
+            sudo mount -t btrfs -o "loop,compress=zstd:$level,noatime" "$IMAGE" "$MOUNT"
+            mounted=1
+            sudo chown "$(id -u):$(id -g)" "$MOUNT"
+            read -r beforeblocks blocksize < <(stat -c '%b %B' "$IMAGE")
+            before=$((beforeblocks*blocksize))
+            start_ns=$(date +%s%N)
+            cp -a -- "$SAMPLE"/. "$MOUNT"/
+            sudo btrfs filesystem sync "$MOUNT" >> "$LOG" 2>&1
+            end_ns=$(date +%s%N)
+            read -r afterblocks blocksize < <(stat -c '%b %B' "$IMAGE")
+            after=$((afterblocks*blocksize))
+            equal=no
+            if diff -qr -- "$SAMPLE" "$MOUNT" >/dev/null 2>&1; then equal=yes; fi
+            duration_ms=$(((end_ns-start_ns)/1000000))
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$level" "$count" "$sample_bytes" "$before" "$after" "$((after-before))" "$duration_ms" "$equal" >> "$TSV"
+            echo "ZSTD:$level logical_sample=$sample_bytes new_physical_bytes=$((after-before)) elapsed_ms=$duration_ms verified=$equal" | tee -a "$LOG"
+            # compsize reads extent accounting, which complements the physical delta.
+            if command -v compsize >/dev/null 2>&1; then
+              timeout 25s compsize "$MOUNT" > "/tmp/rbe-test/p8-compsize-zstd${level}.txt" 2>&1 || true
+            else
+              echo 'compsize unavailable' > "/tmp/rbe-test/p8-compsize-zstd${level}.txt"
+            fi
+            sudo umount "$MOUNT"; mounted=0
+            rm -f "$IMAGE"
+            if [[ "$equal" != yes ]]; then status=failed; reason="verification-failed-zstd-$level"; exit 1; fi
+          done
+          if [[ "$status" == skipped ]]; then status=completed; reason=all-three-levels; fi
+          P8BENCH
+          chmod +x /tmp/rbe-test/p8-benchmark.sh
+          cat > /tmp/rbe-test/p8-final-snapshot.sh <<'P8SNAP'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          label="${1:-snapshot}"
+          log=/tmp/rbe-test/p8-final-task-snapshots.log
+          exec 9>/tmp/rbe-test/p8-snapshot.lock
+          flock -n 9 || exit 0
+          {
+            echo "=== P8 SNAPSHOT $(date -u +'%Y-%m-%dT%H:%M:%SZ') reason=$label ==="
+            df -h / /home/runner/work/los
+            swapon --show=NAME,SIZE,USED --noheadings || true
+            free -h | head -n 3
+            if [ -f /tmp/los20-workspace-btrfs.img ]; then
+              stat -c 'btrfs_backing_blocks=%b block_bytes=%B apparent_bytes=%s' \
+                /tmp/los20-workspace-btrfs.img || true
+            fi
+            echo '--- LAST 8 NINJA PROGRESS LINES (BOUNDED TAIL) ---'
+            tail -c 65536 /tmp/rbe-test/full-rom-build.log 2>/dev/null \
+              | grep -aE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' | tail -n 8 || true
+            echo '--- PROCESS TREE: CPU/MEM (NO ENV OR SECRET CONTENT) ---'
+            ps -eo pid,ppid,pgid,etime,%cpu,rss,stat,comm --sort=-rss | head -n 65 || true
+            echo '--- RELEVANT RUNNING BUILD TOOLS (BOUNDED COMMAND LINES) ---'
+            ps -eo pid,ppid,etime,stat,comm,args --no-headers \
+              | awk '$5 ~ /^(ninja|soong_ui|soong_build|mkuserimg_mke2fs|e2fsdroid|img2simg|avbtool|apexer|zip|java|python3|dex2oat|brillo_update_payload|reproxy|rewrapper)$/ {print}' \
+              | cut -c 1-420 | head -n 80 || true
+            echo '--- ACTIVE OUTPUT TOP-LEVEL (NO RECURSIVE WALK) ---'
+            ls -lh /home/runner/work/los/out/target/product/star2lte/*.{img,zip} 2>/dev/null | tail -n 30 || true
+          } >> "$log" 2>&1
+          P8SNAP
+          chmod +x /tmp/rbe-test/p8-final-snapshot.sh
+          echo 'P8 benchmark and late-action snapshots prepared.'
+
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
         # P6: step timeout is secondary to the whole-job 345-minute guard.
@@ -1825,6 +1990,8 @@ jobs:
             local p7_trim_started=0 p7_swap_last_try=0
             local p7_ninja_pct=0 p7_swap_status=''
             local p6_ninja_last_epoch p6_ninja_started_epoch
+            local p8_bench_launched=0 p8_bench_pid='' p8_last_snapshot_epoch=0
+            local p8_current_pct=0 p8_progress_marker=''
             p6_ninja_started_epoch="$(date +%s)"
             p6_ninja_last_epoch="$p6_ninja_started_epoch"
             rm -f "$status_file" "$disk_trip" "$time_trip"
@@ -1926,6 +2093,38 @@ jobs:
                 fi
               fi
 
+              # P8: one 128-object benchmark at >=30% Ninja, strictly capped
+              # in disk budget, wall clock and CPU priority; never block guards.
+              # Progress comes from the last 64 KiB only (no huge log parsing).
+              if [ "$phase" = full-rom-build ]; then
+                p8_progress_marker="$(tail -c 65536 "$log_file" 2>/dev/null \
+                  | grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' \
+                  | tail -n 1 || true)"
+                if [[ "$p8_progress_marker" =~ ([0-9]+)/([0-9]+) ]]; then
+                  p8_current_pct="$(awk -v done="${BASH_REMATCH[1]}" -v all="${BASH_REMATCH[2]}" \
+                    'BEGIN {if (all>0) printf "%.4f", 100*done/all; else print 0}')"
+                fi
+                if (( p8_bench_launched == 0 && available >= P8_BENCH_MIN_FREE_GIB*1073741824 && seconds_left > 1800 )) \
+                   && [[ "$WORKSPACE_STORAGE" == btrfs_zstd && "$P8_BENCH_ENABLED" == 1 ]] \
+                   && awk -v pct="$p8_current_pct" -v threshold="$P8_BENCH_START_PERCENT" \
+                     'BEGIN {exit !(pct>=threshold)}'; then
+                  p8_bench_launched=1
+                  (nice -n 15 ionice -c3 timeout --signal=TERM --kill-after=5s \
+                    "${P8_BENCH_TIMEOUT_SECONDS}s" /tmp/rbe-test/p8-benchmark.sh \
+                      >> /tmp/rbe-test/p8-benchmark-outer.log 2>&1 || true) &
+                  p8_bench_pid=$!
+                  echo "P8: launched bounded compression benchmark at ${p8_current_pct}% Ninja."
+                fi
+                if { (( available < P8_FINAL_SNAPSHOT_FREE_GIB*1073741824 )) || \
+                     awk -v pct="$p8_current_pct" -v threshold="$P8_FINAL_SNAPSHOT_PERCENT" \
+                       'BEGIN {exit !(pct>=threshold)}'; } \
+                   && (( now-p8_last_snapshot_epoch >= P8_FINAL_SNAPSHOT_INTERVAL_SECONDS )); then
+                  p8_last_snapshot_epoch=$now
+                  timeout 8s /tmp/rbe-test/p8-final-snapshot.sh "near-end-pct-${p8_current_pct}-disk-${free_gib}GiB" \
+                    >> /tmp/rbe-test/p8-snapshot-outer.log 2>&1 || true
+                fi
+              fi
+
               # P7: late disk-space recovery.  This is intentionally
               # before the 7-GiB stop, with no change to the stop threshold.
               # Both helpers are bounded, best-effort, and write real df/stat
@@ -1956,12 +2155,21 @@ jobs:
               fi
 
               if (( available < DISK_STOP_GIB * 1073741824 )); then
+                if [ "$phase" = full-rom-build ]; then
+                  # Do not hold the 7-GiB disk guard while collecting diagnostics.
+                  (timeout 8s /tmp/rbe-test/p8-final-snapshot.sh disk-guard-trigger \
+                    >> /tmp/rbe-test/p8-snapshot-outer.log 2>&1 || true) &
+                fi
                 echo "Disk safety stop in $phase: available below ${DISK_STOP_GIB} GiB" | tee "$disk_trip"
                 echo "::error::Insufficient disk in $phase; terminating children."
                 stop_process_tree "$BUILD_PID"
                 break
               fi
               if (( now >= SOFT_DEADLINE_EPOCH )); then
+                if [ "$phase" = full-rom-build ]; then
+                  (timeout 8s /tmp/rbe-test/p8-final-snapshot.sh time-guard-trigger \
+                    >> /tmp/rbe-test/p8-snapshot-outer.log 2>&1 || true) &
+                fi
                 echo "Time safety stop in $phase: passed ${FULL_ROM_SOFT_DEADLINE_MINUTES}-minute whole-job deadline" | tee "$time_trip"
                 echo "::error::Stopping $phase before GitHub job timeout to preserve diagnostics."
                 stop_process_tree "$BUILD_PID"
@@ -2402,6 +2610,18 @@ jobs:
             echo ''
             echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
             echo "Workspace: **${WORKSPACE_STORAGE}**; Ninja remote=${NINJA_REMOTE_NUM_JOBS}, local=2, highmem=${NINJA_HIGHMEM_NUM_JOBS}."
+            echo "P8 Btrfs ZSTD level: **${BTRFS_ZSTD_LEVEL}**; benchmark ZSTD 1/3/5 is bounded and observational."
+            if [ -s /tmp/rbe-test/p8-compression-benchmark.tsv ]; then
+              echo '### P8 compression benchmark'
+              echo '```'
+              cat /tmp/rbe-test/p8-compression-benchmark.tsv
+              echo '```'
+            fi
+            if [ -s /tmp/rbe-test/p8-benchmark-status.txt ]; then
+              echo 'P8 benchmark status:'
+              cat /tmp/rbe-test/p8-benchmark-status.txt
+            fi
+
             echo 'P5: legacy RBE_log_path removed; verbose=0; app/records under workspace compression (when Btrfs is selected).'
             echo "P6: whole-job guard=${FULL_ROM_SOFT_DEADLINE_MINUTES}m / 360m; deep storage=${P5_STORAGE_SAMPLE_INTERVAL_SECONDS}s; Ninja throughput=${P6_NINJA_SAMPLE_INTERVAL_SECONDS}s."
             echo ''
@@ -2764,6 +2984,34 @@ jobs:
             if [ -s "$file" ]; then echo "--- $file"; tail -n 50 "$file"; fi
           done
           echo 'P5/P7 diagnostics: do not delete live RBE logs or build outputs.'
+
+      - name: P8 report compression, benchmark, and last active tasks
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /tmp/rbe-test
+          echo '=== P8 ZSTD WORKSPACE COMPRESSION ==='
+          cat /tmp/rbe-test/p8-compression-config.txt 2>/dev/null || true
+          cat /tmp/rbe-test/p8-benchmark-status.txt 2>/dev/null || true
+          echo '=== ZSTD 1 / 3 / 5 OBJECT BENCHMARK ==='
+          cat /tmp/rbe-test/p8-compression-benchmark.tsv 2>/dev/null || true
+          echo '=== LAST BUILD SNAPSHOT ==='
+          tail -n 100 /tmp/rbe-test/p8-final-task-snapshots.log 2>/dev/null || true
+          # compsize on out/soong can take a long time; only attempt AFTER build
+          # and limit to 45 seconds. An incomplete scan is labelled as such.
+          if command -v compsize >/dev/null 2>&1 && \
+             [ -d /home/runner/work/los/out/soong/.intermediates ]; then
+            echo '=== P8 COMPSIZE OUT/SOONG (BEST EFFORT, MAX 45 SECONDS) ==='
+            if nice -n 15 timeout 45s compsize \
+                /home/runner/work/los/out/soong/.intermediates \
+                > /tmp/rbe-test/p8-out-soong-compsize.txt 2>&1; then
+              echo complete > /tmp/rbe-test/p8-out-soong-compsize-status.txt
+            else
+              echo incomplete-or-timeout > /tmp/rbe-test/p8-out-soong-compsize-status.txt
+            fi
+          fi
+          echo 'P8 measurements preserve all generated outputs and existing disk guards.'
 
       - name: Release hybrid swap at job end (best effort)
         if: always()
