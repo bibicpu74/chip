@@ -1,8 +1,17 @@
-name: LineageOS 20.0 - star2lte P8 Btrfs ZSTD3 + measured compression
+name: LineageOS 20.0 - star2lte P9 Clang g1 + Java JAR diagnostics
 
 on:
   workflow_dispatch:
     inputs:
+      debug_info_level:
+        description: "Native Clang DWARF level (g1 reduces native debug size; g keeps baseline)"
+        type: choice
+        required: true
+        default: debug_level_1
+        options:
+          - debug_level_1
+          - debug_level_g
+          - debug_level_0
       workspace_storage:
         description: "Android workspace: Btrfs ZSTD (default), or uncompressed plain"
         type: choice
@@ -27,6 +36,10 @@ jobs:
     env:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
       WORKSPACE_STORAGE: "${{ inputs.workspace_storage }}"
+      CLANG_DEFAULT_DEBUG_LEVEL: "${{ inputs.debug_info_level || 'debug_level_1' }}"
+      # Purely observational P9 diagnostics: no Java flags or JAR files are changed.
+      P9_JAR_SCAN_TIMEOUT_SECONDS: "95"
+      P9_BENCH_TIMEOUT_SECONDS: "210"
       BTRFS_WORKSPACE_IMAGE_GIB: "220"
       # P8: compress the complete workspace from the first repo write.
       BTRFS_ZSTD_LEVEL: "3"
@@ -74,7 +87,7 @@ jobs:
 
       # Android Soong uses remote Ninja concurrency independently of -j2.
       # Keep the 2-job local pool, highmem pool=1; try up to 16 remote actions.
-      NINJA_REMOTE_NUM_JOBS: "16"
+      NINJA_REMOTE_NUM_JOBS: "32"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
       # Soong graph generation is local even with BuildBuddy RBE.
@@ -788,6 +801,54 @@ jobs:
           fi
           echo 'P1 trim changes the checkout only, not .repo Git object packs.'
 
+      # P9: Old Android 13 Soong may hardcode "-g" in commonGlobalCflags.
+      # Newer Soong branches honor CLANG_DEFAULT_DEBUG_LEVEL directly.
+      # Modify only that ONE Go string literal when required; no global -g0.
+      - name: P9 configure and verify native Clang debug level in Soong source
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          python3 - <<'PYDEBUG'
+          from pathlib import Path
+          import os, re, hashlib
+          requested=os.environ['CLANG_DEFAULT_DEBUG_LEVEL']
+          flags={'debug_level_1':'-g1','debug_level_g':'-g','debug_level_0':'-g0'}
+          if requested not in flags:
+              raise SystemExit(f'unsupported debug level: {requested}')
+          path=Path('build/soong/cc/config/global.go')
+          data=path.read_text()
+          intended=flags[requested]
+          if re.search(r'Getenv\s*\(\s*[\"\']CLANG_DEFAULT_DEBUG_LEVEL[\"\']', data):
+              mode='native-soong-env-support'
+          else:
+              # The selected cc config list is the only scope to edit.
+              m=re.search(r'\bcommonGlobalCflags\s*=\s*\[\]string\s*\{', data)
+              if m is None:
+                  raise SystemExit('Cannot identify commonGlobalCflags slice; refusing an unsafe patch')
+              tail=data[m.end():]
+              closing=re.search(r'^\s*\}',tail,re.M)
+              if closing is None: raise SystemExit('Malformed commonGlobalCflags slice')
+              body=tail[:closing.start()]
+              matches=list(re.finditer(r'(?m)^([ \t]*)"-g"\s*,(\s*(?://[^\n]*)?)$',body))
+              if len(matches)!=1:
+                  raise SystemExit(f'Expected one global -g literal, found {len(matches)}; refusing patch')
+              if requested!='debug_level_g':
+                  a,b=matches[0].span()
+                  body=body[:a]+matches[0].group(0).replace('"-g"',f'"{intended}"',1)+body[b:]
+                  data=data[:m.end()]+body+tail[closing.start():]
+                  path.write_text(data)
+                  mode='patched-commonGlobalCflags'
+              else:
+                  mode='baseline-hardcoded-g'
+          # Record only source hash and configuration, no credential values.
+          report=Path('/tmp/rbe-test/p9-debug-soong.txt')
+          report.write_text(f'requested={requested}\nexpected_flag={intended}\nmode={mode}\n'
+                            f'source_sha256={hashlib.sha256(path.read_bytes()).hexdigest()}\n')
+          print(report.read_text())
+          PYDEBUG
+
       - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
         shell: bash
@@ -1415,120 +1476,12 @@ jobs:
 
       # P8 instrumentation remains outside the workspace and does NOT mutate
       # generated Android objects or the Soong build graph.
-      - name: Prepare P8 bounded ZSTD benchmark and final-task snapshots
+      - name: Prepare bounded final-task snapshots (P9)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/rbe-test
-          cat > /tmp/rbe-test/p8-benchmark.sh <<'P8BENCH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          LOG=/tmp/rbe-test/p8-compression-benchmark.log
-          TSV=/tmp/rbe-test/p8-compression-benchmark.tsv
-          STATUS=/tmp/rbe-test/p8-benchmark-status.txt
-          WORK=/tmp/p8-zstd-benchmark
-          SAMPLE="$WORK/sample"
-          MOUNT="$WORK/mount"
-          IMAGE="$WORK/comparison.img"
-          mkdir -p /tmp/rbe-test
-          exec 9>/tmp/rbe-test/p8-benchmark.lock
-          flock -n 9 || exit 0
-          status=skipped
-          reason=not-started
-          mounted=0
-          cleanup() {
-            local rc=$?
-            if (( mounted == 1 )); then sudo umount "$MOUNT" >/dev/null 2>&1 || true; fi
-            if mountpoint -q "$MOUNT"; then sudo umount -l "$MOUNT" >/dev/null 2>&1 || true; fi
-            rm -rf -- "$WORK" || true
-            if (( rc != 0 )) && [[ "$status" != completed ]]; then status=failed; reason="exit-$rc"; fi
-            printf 'status=%s\nreason=%s\n' "$status" "$reason" > "$STATUS"
-            echo "P8_BENCH status=$status reason=$reason"
-          }
-          trap cleanup EXIT
-          trap 'exit 124' TERM INT
-          mkdir -p /tmp/rbe-test "$SAMPLE" "$MOUNT"
-          printf 'level\tsample_files\tsample_logical_bytes\timage_base_alloc_bytes\timage_after_alloc_bytes\tadditional_alloc_bytes\tcopy_and_flush_ms\tverified_equal\n' > "$TSV"
-          if [[ "${WORKSPACE_STORAGE:-plain}" != btrfs_zstd ]]; then reason=plain-workspace; exit 0; fi
-          if ! command -v compsize >/dev/null 2>&1; then
-            echo 'compsize unavailable; physical allocation comparison still runs.' >> "$LOG"
-          fi
-          free_bytes=$(df -B1 --output=avail / | tail -n1 | tr -d ' ')
-          if (( free_bytes < ${P8_BENCH_MIN_FREE_GIB:-25} * 1073741824 )); then reason=low-host-disk; exit 0; fi
-          # Sample 128 stable, already-built .o files, <=96 MiB total.  Avoid a
-          # heavyweight sort over the entire .intermediates tree while Ninja is live.
-          # Give sampling a firm 35s cap; a missing sample is never a ROM failure.
-          if ! timeout 35s python3 - "$SAMPLE" <<'P8SAMPLE'
-          from pathlib import Path
-          import os, shutil, sys
-          root=Path('out/soong/.intermediates'); dest=Path(sys.argv[1]); count=0; total=0
-          max_total=96*1024*1024
-          if not root.is_dir(): sys.exit(2)
-          for directory, dirs, filenames in os.walk(root):
-              dirs.sort()
-              for name in sorted(filenames):
-                  if not name.endswith('.o'): continue
-                  src=Path(directory)/name
-                  try: st=src.stat()
-                  except OSError: continue
-                  if st.st_size < 64*1024 or st.st_size > 8*1024*1024 or total + st.st_size > max_total: continue
-                  dst=dest/f'{count:04d}.o'
-                  try:
-                      shutil.copyfile(src,dst)
-                      if dst.stat().st_size != st.st_size:
-                          dst.unlink(missing_ok=True); continue
-                  except OSError:
-                      dst.unlink(missing_ok=True); continue
-                  count+=1; total+=st.st_size
-                  if count >= 128 or total >= 80*1024*1024: break
-              if count >= 128 or total >= 80*1024*1024: break
-          print(f'sample_count={count} sample_bytes={total}',flush=True)
-          sys.exit(0 if count>=16 and total>=12*1024*1024 else 3)
-          P8SAMPLE
-          then reason=insufficient-or-unstable-object-sample; exit 0; fi
-          count=$(find "$SAMPLE" -maxdepth 1 -type f -name '*.o' | wc -l)
-          sample_bytes=$(du -sb "$SAMPLE" | awk '{print $1}')
-          echo "P8 SAMPLE: count=$count size=$sample_bytes" | tee "$LOG"
-          # A single 768 MiB SPARSE image reused across levels; never allocate all
-          # three images at once or expose logical image size as disk savings.
-          for level in 1 3 5; do
-            free_bytes=$(df -B1 --output=avail / | tail -n1 | tr -d ' ')
-            if (( free_bytes < ${P8_BENCH_MIN_FREE_GIB:-25} * 1073741824 )); then
-              echo "SKIP LEVEL $level: disk headroom insufficient" | tee -a "$LOG"
-              status=partial; reason=low-disk-mid-benchmark; break
-            fi
-            truncate -s 768M "$IMAGE"
-            sudo mkfs.btrfs -f -m single -d single "$IMAGE" >> "$LOG" 2>&1
-            sudo mount -t btrfs -o "loop,compress=zstd:$level,noatime" "$IMAGE" "$MOUNT"
-            mounted=1
-            sudo chown "$(id -u):$(id -g)" "$MOUNT"
-            read -r beforeblocks blocksize < <(stat -c '%b %B' "$IMAGE")
-            before=$((beforeblocks*blocksize))
-            start_ns=$(date +%s%N)
-            cp -a -- "$SAMPLE"/. "$MOUNT"/
-            sudo btrfs filesystem sync "$MOUNT" >> "$LOG" 2>&1
-            end_ns=$(date +%s%N)
-            read -r afterblocks blocksize < <(stat -c '%b %B' "$IMAGE")
-            after=$((afterblocks*blocksize))
-            equal=no
-            if diff -qr -- "$SAMPLE" "$MOUNT" >/dev/null 2>&1; then equal=yes; fi
-            duration_ms=$(((end_ns-start_ns)/1000000))
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-              "$level" "$count" "$sample_bytes" "$before" "$after" "$((after-before))" "$duration_ms" "$equal" >> "$TSV"
-            echo "ZSTD:$level logical_sample=$sample_bytes new_physical_bytes=$((after-before)) elapsed_ms=$duration_ms verified=$equal" | tee -a "$LOG"
-            # compsize reads extent accounting, which complements the physical delta.
-            if command -v compsize >/dev/null 2>&1; then
-              timeout 25s compsize "$MOUNT" > "/tmp/rbe-test/p8-compsize-zstd${level}.txt" 2>&1 || true
-            else
-              echo 'compsize unavailable' > "/tmp/rbe-test/p8-compsize-zstd${level}.txt"
-            fi
-            sudo umount "$MOUNT"; mounted=0
-            rm -f "$IMAGE"
-            if [[ "$equal" != yes ]]; then status=failed; reason="verification-failed-zstd-$level"; exit 1; fi
-          done
-          if [[ "$status" == skipped ]]; then status=completed; reason=all-three-levels; fi
-          P8BENCH
-          chmod +x /tmp/rbe-test/p8-benchmark.sh
+          echo 'P9 benchmark supersedes P8 object-only benchmark.'
           cat > /tmp/rbe-test/p8-final-snapshot.sh <<'P8SNAP'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -1560,6 +1513,134 @@ jobs:
           P8SNAP
           chmod +x /tmp/rbe-test/p8-final-snapshot.sh
           echo 'P8 benchmark and late-action snapshots prepared.'
+
+      # Diagnostic helpers: never remove/copy any live Ninja outputs.
+      - name: P9 prepare stable JAR and object compression benchmark and ROM progress reader
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          cat > /tmp/rbe-test/p9-progress.py <<'P9PROGRESS'
+          #!/usr/bin/env python3
+          import sys,re,collections
+          path=sys.argv[1]
+          try:
+              with open(path,'rb') as f:
+                  f.seek(0,2); size=f.tell()
+                  f.seek(max(0,size-131072)); sample=f.read().decode('utf-8','replace')
+          except OSError:
+              print('0.0000 0 0');sys.exit(0)
+          # Ignore bootstrap/regen-globs subgraph (1024/1025) and zero-total.
+          found=[(int(a),int(b)) for a,b in re.findall(r'\[\s*\d+%\s+(\d+)/(\d+)\]', sample)]
+          valid=[(a,b) for a,b in found if b>=10000 and 0<=a<=b]
+          if not valid:print('0.0000 0 0');sys.exit(0)
+          total=collections.Counter(b for _,b in valid).most_common(1)[0][0]
+          done=max(a for a,b in valid if b==total)
+          print(f'{100*done/total:.4f} {done} {total}')
+          P9PROGRESS
+          chmod +x /tmp/rbe-test/p9-progress.py
+          cat > /tmp/rbe-test/p9-benchmark.sh <<'P9BENCH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          LOG=/tmp/rbe-test/p9-compression-benchmark.log
+          TSV=/tmp/rbe-test/p9-compression-benchmark.tsv
+          STATUS=/tmp/rbe-test/p9-benchmark-status.txt
+          WORK=/tmp/p9-zstd-benchmark
+          SAMPLE="$WORK/sample"; MOUNT="$WORK/mount"; IMAGE="$WORK/test.img"
+          exec 9>/tmp/rbe-test/p9-benchmark.lock
+          flock -n 9 || exit 0
+          status=skipped; reason=not-started; mounted=0
+          cleanup() {
+            rc=$?
+            if mountpoint -q "$MOUNT"; then sudo umount "$MOUNT" >/dev/null 2>&1 || sudo umount -l "$MOUNT" >/dev/null 2>&1 || true; fi
+            rm -rf -- "$WORK" || true
+            if ((rc!=0)) && [[ "$status" != completed ]]; then status=failed;reason="exit-$rc"; fi
+            printf 'status=%s\nreason=%s\n' "$status" "$reason" > "$STATUS"
+          }
+          trap cleanup EXIT
+          mkdir -p "$SAMPLE" "$MOUNT"
+          printf 'level\to_files\tjar_files\tlogical_sample_bytes\tbase_alloc_bytes\tfinal_alloc_bytes\tdelta_alloc_bytes\tcopy_ms\tidentical\n' > "$TSV"
+          [[ "${WORKSPACE_STORAGE:-plain}" == btrfs_zstd ]] || { reason=plain-workspace; exit 0; }
+          free_bytes=$(df -B1 --output=avail / | tail -n1 | tr -d ' ')
+          (( free_bytes >= ${P8_BENCH_MIN_FREE_GIB:-25}*1073741824 )) || { reason=low-host-disk; exit 0; }
+          # P9: time-bounded search in productive, high-probability subtrees;
+          # sample BOTH .o and .jar, not an entire filesystem-wide sorted walk.
+          set +e
+          timeout 85s python3 - "$SAMPLE" <<'P9SAMPLE' > /tmp/rbe-test/p9-benchmark-sample.txt 2>&1
+          import os,sys,time,shutil
+          from pathlib import Path
+          root=Path('out/soong/.intermediates'); dest=Path(sys.argv[1]); start=time.monotonic()
+          choices=['frameworks/base','frameworks/native','art','external','system','packages','bionic','libcore','hardware']
+          counts={'.o':0,'.jar':0}; totals={'.o':0,'.jar':0}
+          caps={'.o':32*1024*1024,'.jar':32*1024*1024}
+          roots=[root/s for s in choices if (root/s).is_dir()]
+          if root.is_dir(): roots.append(root)
+          seen=set()
+          for seed in roots:
+              if time.monotonic()-start>74:break
+              for folder, subdirs, files in os.walk(seed):
+                  if time.monotonic()-start>74:break
+                  # prune metadata-heavy dirs with negligible compiled files
+                  subdirs[:]=[d for d in subdirs if d not in ('.git','.repo','.temp','temp')]
+                  for name in files:
+                      ext=Path(name).suffix
+                      if ext not in counts or counts[ext]>=64 or totals[ext]>=caps[ext]:continue
+                      src=Path(folder)/name
+                      target=None
+                      try:
+                          st=src.stat()
+                          if not st.st_size or st.st_size<32*1024 or st.st_size>8*1024*1024:continue
+                          if totals[ext]+st.st_size>caps[ext]:continue
+                          if (st.st_dev,st.st_ino) in seen:continue
+                          target=dest/f'{ext[1:]}-{counts[ext]:03d}{ext}'
+                          shutil.copyfile(src,target)
+                          st2=src.stat()
+                          if st.st_size!=st2.st_size or st.st_mtime_ns!=st2.st_mtime_ns or target.stat().st_size!=st.st_size:
+                              target.unlink(missing_ok=True);continue
+                          seen.add((st.st_dev,st.st_ino));counts[ext]+=1;totals[ext]+=st.st_size
+                      except OSError:
+                          if target is not None: target.unlink(missing_ok=True)
+                  if all(counts[e]>=8 and totals[e]>=4*1024*1024 for e in counts):break
+              if all(counts[e]>=8 and totals[e]>=4*1024*1024 for e in counts):break
+          print(' '.join(f'{e[1:]}_count={counts[e]} {e[1:]}_bytes={totals[e]}' for e in counts),flush=True)
+          sys.exit(0 if sum(totals.values())>=4*1024*1024 else 3)
+          P9SAMPLE
+          rc=$?
+          set -e
+          cat /tmp/rbe-test/p9-benchmark-sample.txt | tee "$LOG"
+          if (( rc!=0 )); then reason="sample-exit-$rc"; exit 0; fi
+          o_count=$(find "$SAMPLE" -maxdepth 1 -type f -name '*.o' | wc -l)
+          jar_count=$(find "$SAMPLE" -maxdepth 1 -type f -name '*.jar' | wc -l)
+          sample_bytes=$(du -sb "$SAMPLE" | awk '{print $1}')
+          for level in 1 3 5; do
+            free_bytes=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+            if (( free_bytes < ${P8_BENCH_MIN_FREE_GIB:-25}*1073741824 )); then status=partial; reason=low-disk-mid-benchmark; break; fi
+            truncate -s 768M "$IMAGE"
+            sudo mkfs.btrfs -f -m single -d single "$IMAGE" >> "$LOG" 2>&1
+            sudo mount -t btrfs -o "loop,compress=zstd:$level,noatime" "$IMAGE" "$MOUNT"
+            mounted=1
+            sudo chown "$(id -u):$(id -g)" "$MOUNT"
+            read -r blocks sz < <(stat -c '%b %B' "$IMAGE"); before=$((blocks*sz))
+            start_ns=$(date +%s%N)
+            cp -a "$SAMPLE"/. "$MOUNT"/
+            sudo btrfs filesystem sync "$MOUNT" >> "$LOG" 2>&1
+            end_ns=$(date +%s%N)
+            read -r blocks sz < <(stat -c '%b %B' "$IMAGE"); after=$((blocks*sz))
+            identical=no
+            if diff -qr "$SAMPLE" "$MOUNT" >/dev/null 2>&1; then identical=yes; fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$level" "$o_count" "$jar_count" "$sample_bytes" "$before" "$after" "$((after-before))" "$(((end_ns-start_ns)/1000000))" "$identical" >> "$TSV"
+            echo "P9 ZSTD:$level allocated_delta=$((after-before)) bytes matched=$identical" >> "$LOG"
+            if command -v compsize >/dev/null 2>&1; then
+              sudo -n timeout 12s compsize "$MOUNT" > "/tmp/rbe-test/p9-compsize-zstd${level}.txt" 2>&1 || true
+            fi
+            sudo umount "$MOUNT";mounted=0
+            rm -f "$IMAGE"
+            if [[ "$identical" != yes ]]; then status=failed; reason="mismatch-zstd-$level"; exit 1; fi
+          done
+          if [[ "$status" == skipped ]]; then status=completed;reason=all-levels; fi
+          P9BENCH
+          chmod +x /tmp/rbe-test/p9-benchmark.sh
+          echo 'P9 benchmark and large-Ninja progress reader prepared.'
 
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
@@ -2082,6 +2163,18 @@ jobs:
                 fi
               fi
 
+              # P9: cheap PSI / CPU / IO pressure and Java process census.
+              if [ "$phase" = full-rom-build ] && (( sample_counter % 30 == 0 )); then
+                {
+                  printf '%s\t' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+                  awk '/^some / {printf "cpu_%s ", $0}' /proc/pressure/cpu 2>/dev/null
+                  awk '/^some / {printf "io_%s ", $0}' /proc/pressure/io 2>/dev/null
+                  printf 'javac_count=%s kotlin_count=%s\n' \
+                    "$(pgrep -fc 'javac' 2>/dev/null || echo 0)" \
+                    "$(pgrep -fc 'kotlinc|K2JVMCompiler' 2>/dev/null || echo 0)"
+                } >> /tmp/rbe-test/p9-cpu-java-pressure.log || true
+              fi
+
               # P6: Ninja throughput from the last 256 KiB of the local log.
               # Does not scan source/out or read the entire build log.
               if [ "$phase" = full-rom-build ] && \
@@ -2093,16 +2186,16 @@ jobs:
                 fi
               fi
 
-              # P8: one 128-object benchmark at >=30% Ninja, strictly capped
+              # P9: one bounded OBJECT+JAR benchmark at >=30% ROM Ninja, strictly capped
               # in disk budget, wall clock and CPU priority; never block guards.
-              # Progress comes from the last 64 KiB only (no huge log parsing).
+              # Progress reader ignores regen-globs and uses the last 128 KiB.
               if [ "$phase" = full-rom-build ]; then
-                p8_progress_marker="$(tail -c 65536 "$log_file" 2>/dev/null \
-                  | grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' \
-                  | tail -n 1 || true)"
-                if [[ "$p8_progress_marker" =~ ([0-9]+)/([0-9]+) ]]; then
-                  p8_current_pct="$(awk -v done="${BASH_REMATCH[1]}" -v all="${BASH_REMATCH[2]}" \
-                    'BEGIN {if (all>0) printf "%.4f", 100*done/all; else print 0}')"
+                # P9: ignore internal 1024/1025 regen-globs; valid ROM totals >=10k.
+                read -r p8_current_pct p9_done p9_total < <( \
+                  python3 /tmp/rbe-test/p9-progress.py "$log_file" || printf '0.0000 0 0\n')
+                if (( p9_total > 0 )); then
+                  echo "P9_ROM_PROGRESS completed=$p9_done total=$p9_total pct=$p8_current_pct" \
+                    >> /tmp/rbe-test/p9-rom-progress.log
                 fi
                 if (( p8_bench_launched == 0 && available >= P8_BENCH_MIN_FREE_GIB*1073741824 && seconds_left > 1800 )) \
                    && [[ "$WORKSPACE_STORAGE" == btrfs_zstd && "$P8_BENCH_ENABLED" == 1 ]] \
@@ -2110,10 +2203,10 @@ jobs:
                      'BEGIN {exit !(pct>=threshold)}'; then
                   p8_bench_launched=1
                   (nice -n 15 ionice -c3 timeout --signal=TERM --kill-after=5s \
-                    "${P8_BENCH_TIMEOUT_SECONDS}s" /tmp/rbe-test/p8-benchmark.sh \
+                    "${P9_BENCH_TIMEOUT_SECONDS}s" /tmp/rbe-test/p9-benchmark.sh \
                       >> /tmp/rbe-test/p8-benchmark-outer.log 2>&1 || true) &
                   p8_bench_pid=$!
-                  echo "P8: launched bounded compression benchmark at ${p8_current_pct}% Ninja."
+                  echo "P9: launched bounded O+JAR compression benchmark at ${p8_current_pct}% ROM Ninja."
                 fi
                 if { (( available < P8_FINAL_SNAPSHOT_FREE_GIB*1073741824 )) || \
                      awk -v pct="$p8_current_pct" -v threshold="$P8_FINAL_SNAPSHOT_PERCENT" \
@@ -2319,6 +2412,43 @@ jobs:
           fi
 
           echo "BUILD_NINJA=$BUILD_NINJA" | tee /tmp/rbe-test/build-ninja.txt
+
+          # P9: audit generated Clang command fragments without launching
+          # Ninja -t commands (expensive on this multi-GB graph).
+          mark_stage p9-verify-clang-debug
+          python3 - <<'PYFLAG'
+          import os,re
+          from pathlib import Path
+          expect={'debug_level_1':b'-g1','debug_level_g':b'-g','debug_level_0':b'-g0'}[os.environ['CLANG_DEFAULT_DEBUG_LEVEL']]
+          graphs=[Path('out/soong/build.ninja'),Path('out/combined-lineage_star2lte.ninja')]
+          report=Path('/tmp/rbe-test/p9-clang-flags-graph.txt')
+          found=False; results=[]
+          for graph in graphs:
+              if not graph.is_file():continue
+              # Bounded 768 MiB per graph: avoids a full read of the 10+ GiB file.
+              seen=0
+              with graph.open('rb') as f:
+                  tail=b''
+                  while seen<768*1024*1024:
+                      data=f.read(4*1024*1024)
+                      if not data:break
+                      seen+=len(data)
+                      chunk=tail+data
+                      # Must match a complete command flag token; not '-g1' in a filename.
+                      match=re.search(rb'(?<![\w-])'+re.escape(expect)+rb'(?![\w-])',chunk)
+                      if match:
+                          snippet=chunk[max(0,match.start()-90):match.end()+90].decode('utf-8','replace')
+                          results.append(f'{graph}: FOUND expected={expect.decode()} after {seen} bytes; excerpt={snippet[:240]!r}')
+                          found=True;break
+                      tail=data[-32:]
+              if not found:results.append(f'{graph}: NOT OBSERVED in first {seen} bytes')
+              if found:break
+          state='observed-in-generated-graph' if found else 'inconclusive-bounded-graph-scan'
+          report.write_text('status='+state+'\n'+'\n'.join(results)+'\n')
+          print(report.read_text())
+          # The patch/Soong env audit is authoritative for the requested default;
+          # a limited Ninja graph scan cannot prove all per-module overrides.
+          PYFLAG
 
           mark_stage verify-rbe-graph
           echo "=== VERIFY REWRAPPER IS PRESENT IN GENERATED GRAPH ==="
@@ -3001,10 +3131,10 @@ jobs:
           # compsize on out/soong can take a long time; only attempt AFTER build
           # and limit to 45 seconds. An incomplete scan is labelled as such.
           if command -v compsize >/dev/null 2>&1 && \
-             [ -d /home/runner/work/los/out/soong/.intermediates ]; then
+             [ -d /home/runner/work/los/out/soong/.intermediates/frameworks ]; then
             echo '=== P8 COMPSIZE OUT/SOONG (BEST EFFORT, MAX 45 SECONDS) ==='
-            if nice -n 15 timeout 45s compsize \
-                /home/runner/work/los/out/soong/.intermediates \
+            if sudo -n nice -n 15 timeout 30s compsize \
+                /home/runner/work/los/out/soong/.intermediates/frameworks \
                 > /tmp/rbe-test/p8-out-soong-compsize.txt 2>&1; then
               echo complete > /tmp/rbe-test/p8-out-soong-compsize-status.txt
             else
@@ -3012,6 +3142,122 @@ jobs:
             fi
           fi
           echo 'P8 measurements preserve all generated outputs and existing disk guards.'
+
+      # P9: bounded post-build inventory, read-only and off critical build path.
+      - name: P9 analyze JAR intermediates, duplicate candidates and local Java cost
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /tmp/rbe-test
+          cat > /tmp/rbe-test/p9-jar-analysis.py <<'P9JAR'
+          #!/usr/bin/env python3
+          from pathlib import Path
+          from collections import defaultdict, Counter
+          import os,time,hashlib,zipfile,sys,csv
+          root=Path('/home/runner/work/los/out/soong/.intermediates')
+          output=Path('/tmp/rbe-test'); start=time.monotonic()
+          limit=int(os.getenv('P9_JAR_SCAN_TIMEOUT_SECONDS','95'))
+          status='complete'; jar_files=[]; seen=0
+          if not root.exists():
+              (output/'p9-jar-status.txt').write_text('status=skipped\nreason=no-intermediates\n');sys.exit(0)
+          def classify(path):
+              path=str(path).lower()
+              if 'turbine-combined' in path:return 'turbine-combined'
+              if 'repackaged-jarjar' in path:return 'repackaged-jarjar'
+              if 'jarjar' in path:return 'jarjar-other'
+              if 'withres' in path:return 'withres'
+              if '/combined/' in path or 'combined.jar' in path:return 'combined'
+              if 'turbine' in path:return 'turbine-other'
+              if 'classes' in path:return 'classes'
+              return 'other'
+          for folder,dirs,files in os.walk(root):
+              if time.monotonic()-start>limit-18:
+                  status='partial-time-budget';break
+              dirs[:]=[d for d in dirs if d not in ('.git','.repo')]
+              for name in files:
+                  if not name.endswith('.jar'):continue
+                  p=Path(folder)/name
+                  try:sz=p.stat().st_size
+                  except OSError:continue
+                  seen+=1;jar_files.append((sz,p,classify(p)))
+          jar_files.sort(key=lambda x:x[0],reverse=True)
+          groups=defaultdict(lambda:[0,0]);by_owner=defaultdict(lambda:[0,0]);by_size=defaultdict(list)
+          for sz,p,group in jar_files:
+              groups[group][0]+=1;groups[group][1]+=sz
+              rel=p.relative_to(root)
+              # Ownership by source subtree, not guessed Java module identity.
+              owner='/'.join(rel.parts[:3]);by_owner[owner][0]+=1;by_owner[owner][1]+=sz
+              if sz>=128*1024:by_size[sz].append(p)
+          def table(filename,rows):
+              with (output/filename).open('w',newline='') as f:
+                  writer=csv.writer(f,delimiter='\t');writer.writerows(rows)
+          table('p9-jar-by-stage.tsv',[['stage','count','logical_bytes']]+[[k,*v] for k,v in sorted(groups.items(),key=lambda a:a[1][1],reverse=True)])
+          table('p9-jar-by-subtree.tsv',[['subtree','count','logical_bytes']]+[[k,*v] for k,v in sorted(by_owner.items(),key=lambda a:a[1][1],reverse=True)[:80]])
+          table('p9-largest-jars.tsv',[['size_bytes','path']]+[[sz,str(p)] for sz,p,_ in jar_files[:80]])
+          # Exact duplicate sample: same-sized files ONLY, cap bytes and time.
+          hashed=0;hashed_bytes=0;matches=defaultdict(list)
+          for sz,paths in sorted(by_size.items(),key=lambda x:-x[0]):
+              if len(paths)<2 or sz>64*1024*1024:continue
+              if hashed>=300 or hashed_bytes+sz*2>384*1024*1024:break
+              for p in paths:
+                  if hashed>=300 or hashed_bytes+sz>384*1024*1024 or time.monotonic()-start>limit-4:break
+                  try:
+                      h=hashlib.sha256()
+                      with p.open('rb') as f:
+                          for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
+                      matches[(sz,h.hexdigest())].append(p)
+                      hashed+=1;hashed_bytes+=sz
+                  except OSError:continue
+          dupes=[(sz,sha,paths) for (sz,sha),paths in matches.items() if len(paths)>=2]
+          table('p9-jar-exact-duplicates-sample.tsv', [['size_bytes','sha256','file_count','logical_duplicate_bytes','example_paths']]+[[sz,sha,len(paths),sz*(len(paths)-1),' | '.join(str(p) for p in paths[:5])] for sz,sha,paths in sorted(dupes,reverse=True)[:100]])
+          # ZIP entry stored/deflated ratio, strictly bounded sample.
+          zipped=[];zip_total=0
+          for sz,p,_ in jar_files[:96]:
+              if len(zipped)>=32 or zip_total+sz>384*1024*1024:continue
+              try:
+                  with zipfile.ZipFile(p) as archive:
+                      entries=archive.infolist()
+                      uncompressed=sum(i.file_size for i in entries)
+                      compressed=sum(i.compress_size for i in entries)
+                      stored=sum(i.file_size for i in entries if i.compress_type==zipfile.ZIP_STORED)
+                      zipped.append((str(p),sz,uncompressed,compressed,stored,len(entries)))
+                      zip_total+=sz
+              except (OSError,zipfile.BadZipFile):continue
+          table('p9-jar-zip-sample.tsv',[['path','jar_bytes','uncompressed_entries','compressed_entries','stored_entry_uncompressed_bytes','entry_count']]+zipped)
+          text=(f'status={status}\ncount_jar={seen}\nlogical_jar_bytes={sum(x[0] for x in jar_files)}\n'
+                f'sha256_sample_files={hashed}\nsha256_sample_bytes={hashed_bytes}\n'
+                f'exact_duplicate_groups_in_sample={len(dupes)}\n'
+                f'potential_duplicate_logical_bytes_in_sample={sum(sz*(len(paths)-1) for sz,_,paths in dupes)}\n'
+                f'zip_sample_files={len(zipped)}\n'
+                f'elapsed_seconds={time.monotonic()-start:.1f}\n')
+          (output/'p9-jar-status.txt').write_text(text);print(text)
+          P9JAR
+          # A 110s cap ensures diagnostics cannot block GitHub artifact upload.
+          timeout --signal=TERM --kill-after=5s 110s python3 /tmp/rbe-test/p9-jar-analysis.py \
+            > /tmp/rbe-test/p9-jar-analysis.log 2>&1 || true
+          if [ ! -s /tmp/rbe-test/p9-jar-status.txt ]; then
+            printf 'status=timeout-or-error\n' > /tmp/rbe-test/p9-jar-status.txt
+          fi
+          echo '=== P9 CLANG DEBUG CONFIG ==='
+          cat /tmp/rbe-test/p9-debug-soong.txt /tmp/rbe-test/p9-clang-flags-graph.txt 2>/dev/null || true
+          echo '=== P9 JAVA/JAR INVENTORY ==='
+          cat /tmp/rbe-test/p9-jar-status.txt
+          cat /tmp/rbe-test/p9-jar-by-stage.tsv 2>/dev/null | head -20 || true
+          echo '=== P9 BENCHMARK ==='
+          cat /tmp/rbe-test/p9-benchmark-status.txt /tmp/rbe-test/p9-compression-benchmark.tsv 2>/dev/null || true
+          echo '=== P9 RBE JAVA CONFIG ==='
+          for v in RBE_JAVAC RBE_D8 RBE_R8; do
+            printf '%s=%s\n' "$v" "${!v:-unset}"
+          done | tee /tmp/rbe-test/p9-java-rbe-settings.txt
+          {
+            echo '### P9 native debug + Java/JAR diagnostics'
+            echo '```text'
+            cat /tmp/rbe-test/p9-debug-soong.txt /tmp/rbe-test/p9-clang-flags-graph.txt \
+              /tmp/rbe-test/p9-jar-status.txt /tmp/rbe-test/p9-benchmark-status.txt 2>/dev/null
+            echo '```'
+            echo 'JAR report is READ-ONLY; SHA-256 duplicate bytes are logical candidates, not Btrfs physical savings.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Release hybrid swap at job end (best effort)
         if: always()
