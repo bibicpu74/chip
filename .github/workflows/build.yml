@@ -1,4 +1,4 @@
-name: LineageOS 20.0 - star2lte P6 extended deadline + Ninja throughput
+name: LineageOS 20.0 - star2lte P7 safe disk headroom + final packaging
 
 on:
   workflow_dispatch:
@@ -99,6 +99,15 @@ jobs:
       # Starts at initial disk reclaim (before repo sync / graph).
       FULL_ROM_SOFT_DEADLINE_MINUTES: "345"
 
+      # P7: conservative early cleanup, measured physically on the host.
+      P7_UNUSED_RUNTIME_CLEANUP: "1"
+      # Best-effort hole punching through Btrfs -> loop -> host backing file.
+      P7_BTRFS_FSTRIM: "1"
+      # Swapoff of the populated 4-GiB baseline swap is NEVER unconditional.
+      P7_BASE_SWAP_RECLAIM: "1"
+      P7_LATE_SWAP_MIN_PERCENT: "99.50"
+      P7_LATE_SWAP_MIN_RAM_MARGIN_GIB: "5"
+
     steps:
       - name: Reclaim root disk
         shell: bash
@@ -192,6 +201,79 @@ jobs:
             -o "$HOME/bin/repo"
           chmod a+x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      # P7: remove only explicitly unused host-side runtimes.  This runs
+      # after checkout and apt install but BEFORE sync/mount/build; tooling
+      # actually used from PATH is protected.  Do not wipe toolcache blindly.
+      - name: P7 reclaim unused hosted runtimes (conservative)
+        if: ${{ env.P7_UNUSED_RUNTIME_CLEANUP == '1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT=/tmp/rbe-test/p7-runtime-cleanup.tsv
+          mkdir -p /tmp/rbe-test
+          printf 'path\tstatus\tphysical_size_before_bytes\thost_free_delta_bytes\treason\n' > "$REPORT"
+          before_all="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+
+          # Exact candidates verified against the P6 disk inventory.  The
+          # hostedtoolcache list is an allowlist, NOT a recursive wipe.
+          candidates=(/opt/az)
+          shopt -s nullglob
+          candidates+=(/usr/local/julia[0-9]*)
+          for group in Ruby PyPy Go go Java_Temurin-Hotspot_jdk Java_Zulu_jdk; do
+            candidates+=("/opt/hostedtoolcache/$group")
+          done
+          shopt -u nullglob
+          for path in "${candidates[@]}"; do
+            [[ -d "$path" ]] || continue
+            if [[ -L "$path" ]]; then
+              printf '%s\tskipped\t0\t0\tsymlink\n' "$path" >> "$REPORT"
+              continue
+            fi
+            case "$path" in
+              /opt/az|/usr/local/julia[0-9]*|/opt/hostedtoolcache/Ruby|/opt/hostedtoolcache/PyPy|/opt/hostedtoolcache/Go|/opt/hostedtoolcache/go|/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk|/opt/hostedtoolcache/Java_Zulu_jdk) ;;
+              *) echo "::warning::Refused unexpected runtime candidate: $path"; continue ;;
+            esac
+            # Avoid touching any runtime which provides a selected essential
+            # executable. This check is independent of which PATH is first.
+            protected=0
+            protected_reason='not-used-by-build'
+            for runtime_home in JAVA_HOME JDK_HOME ANDROID_JAVA_HOME GOROOT; do
+              runtime_path="${!runtime_home:-}"
+              if [[ -n "$runtime_path" && ( "$runtime_path" == "$path" || "$runtime_path" == "$path/"* ) ]]; then
+                protected=1; protected_reason="active-env-$runtime_home"; break
+              fi
+            done
+            for executable in python3 python git java javac node go ninja cmake clang curl; do
+              resolved="$(command -v "$executable" 2>/dev/null || true)"
+              [[ -n "$resolved" ]] || continue
+              actual="$(readlink -f "$resolved" 2>/dev/null || true)"
+              if [[ "$actual" == "$path/"* || "$actual" == "$path" ]]; then
+                protected=1; protected_reason="active-command-$executable"; break
+              fi
+            done
+            if (( protected )); then
+              printf '%s\tskipped\t0\t0\t%s\n' "$path" "$protected_reason" >> "$REPORT"
+              continue
+            fi
+            used="$(sudo du -sxB1 "$path" 2>/dev/null | awk '{print $1}' || true)"
+            [[ "$used" =~ ^[0-9]+$ ]] || used=0
+            prior="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+            # Use only the exact known path; no shell expansion in rm arguments.
+            if sudo rm -rf --one-file-system -- "$path"; then
+              after="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+              delta=$((after-prior))
+              printf '%s\tremoved\t%s\t%s\tallowlisted-unused-runtime\n' "$path" "$used" "$delta" >> "$REPORT"
+            else
+              printf '%s\tfailed\t%s\t0\tremove-error\n' "$path" "$used" >> "$REPORT"
+              echo "::warning::Could not remove optional runtime: $path"
+            fi
+          done
+          after_all="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+          printf 'root_free_before_bytes=%s\nroot_free_after_bytes=%s\nroot_free_delta_bytes=%s\n' \
+            "$before_all" "$after_all" "$((after_all-before_all))" \
+            | tee /tmp/rbe-test/p7-runtime-cleanup-summary.txt
+          cat "$REPORT"
 
       - name: Validate BuildBuddy secret
         shell: bash
@@ -1213,6 +1295,107 @@ jobs:
           P6NINJA
           chmod +x /tmp/rbe-test/p6-ninja-sample.py
 
+          # P7: measure actual physical reclaim, never the reported FITRIM
+          # "bytes trimmed" counter. No secrets or build output content.
+          cat > /tmp/rbe-test/p7-btrfs-trim.sh <<'P7TRIM'
+          #!/usr/bin/env bash
+          set -u
+          workspace=/home/runner/work/los
+          backing=/tmp/los20-workspace-btrfs.img
+          log=/tmp/rbe-test/p7-btrfs-trim.tsv
+          mkdir -p /tmp/rbe-test
+          exec 9>/tmp/rbe-test/p7-trim.lock
+          flock -n 9 || exit 0
+          stamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          label="${1:-unspecified}"
+          root_before="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+          blocks_before=0; blocks_after=0; status='skipped'; rc=0
+          if [[ "${P7_BTRFS_FSTRIM:-0}" != 1 || "${WORKSPACE_STORAGE:-plain}" != btrfs_zstd ]]; then
+            status='disabled'
+          elif [[ ! -f "$backing" ]] || ! mountpoint -q "$workspace" || \
+               [[ "$(stat -f -c %T "$workspace" 2>/dev/null)" != btrfs ]]; then
+            status='mount-not-ready'
+          else
+            read -r b sz < <(stat -c '%b %B' "$backing")
+            blocks_before=$((b*sz))
+            # Bounded best-effort attempt. Unsupported discard is not an error
+            # for the ROM build. The loop device may not punch host holes.
+            if sudo timeout --signal=TERM --kill-after=5s 45s \
+                  fstrim -v "$workspace" > /tmp/rbe-test/p7-fstrim-last.txt 2>&1; then
+              status='completed'
+            else
+              rc=$?
+              status="unsupported-failed-or-timeout-$rc"
+            fi
+            read -r b sz < <(stat -c '%b %B' "$backing")
+            blocks_after=$((b*sz))
+          fi
+          root_after="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+          printf '%s\t%s\t%s\t%d\t%d\t%d\t%d\n' \
+            "$stamp" "$label" "$status" "$root_before" "$root_after" "$blocks_before" "$blocks_after" >> "$log"
+          echo "P7_FSTRIM $label $status root_delta_bytes=$((root_after-root_before)) image_delta_bytes=$((blocks_before-blocks_after))"
+          exit 0
+          P7TRIM
+          chmod +x /tmp/rbe-test/p7-btrfs-trim.sh
+          printf 'utc\tstage\tstatus\troot_free_before\troot_free_after\timage_alloc_before\timage_alloc_after\n' \
+            > /tmp/rbe-test/p7-btrfs-trim.tsv
+
+          # P7: only release the 4-GiB BASE swap if swapping it back into RAM
+          # leaves a substantial reserve. In P6 the 4 GiB was essentially
+          # FULL during the final active build; in that state it MUST remain.
+          cat > /tmp/rbe-test/p7-base-swap-reclaim.sh <<'P7SWAP'
+          #!/usr/bin/env bash
+          set -u
+          swapfile=/mnt/soong-swap-base
+          logfile=/tmp/rbe-test/p7-base-swap-reclaim.log
+          stage="${1:-unknown}"
+          exec 9>/tmp/rbe-test/p7-swap-reclaim.lock
+          flock -n 9 || exit 0
+          stamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          state='skipped'; reason='not-active'; used=0
+          mem_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+          mem_bytes=$(( ${mem_kib:-0} * 1024 ))
+          used="$(swapon --bytes --noheadings --show=NAME,USED 2>/dev/null | awk -v p="$swapfile" '$1==p {print $2; found=1; exit} END {if (!found) print "na"}')"
+          before="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+          if [[ "${P7_BASE_SWAP_RECLAIM:-0}" != 1 ]]; then
+            reason='disabled'
+          elif [[ ! -f "$swapfile" || ! "$used" =~ ^[0-9]+$ ]]; then
+            reason='swap-not-active'
+          elif [[ "$stage" == early ]]; then
+            # Never discard the safety net before bacon even when unused.
+            reason='preserve-base-swap-during-bacon'
+          elif [[ "$stage" == late && "$used" -gt $((4*1073741824)) ]]; then
+            reason='invalid-used-size'
+          elif (( mem_bytes < used + ${P7_LATE_SWAP_MIN_RAM_MARGIN_GIB:-5}*1073741824 )); then
+            reason='ram-margin-insufficient'
+          elif [[ -f /tmp/rbe-test/p7-base-swap-reclaimed.txt ]]; then
+            reason='already-reclaimed'
+          else
+            # 60s cap; if it times out/fails, do NOT delete an active swapfile.
+            if sudo timeout --signal=TERM --kill-after=10s 60s swapoff "$swapfile"; then
+              rc=0
+            else
+              rc=$?
+            fi
+            if (( rc == 0 )) && ! swapon --noheadings --show=NAME | grep -Fxq "$swapfile"; then
+              if sudo rm -f -- "$swapfile"; then
+                state='reclaimed'; reason='swapoff-ok-file-unlinked'
+                printf '%s\n' "$stamp" > /tmp/rbe-test/p7-base-swap-reclaimed.txt
+              else
+                state='deactivated'; reason='file-unlink-failed'
+              fi
+            else
+              reason="swapoff-failed-or-timeout-$rc"
+            fi
+          fi
+          after="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+          printf '%s stage=%s status=%s reason=%s used_bytes=%s ram_available_bytes=%s host_free_before_bytes=%s host_free_after_bytes=%s host_free_delta_bytes=%s\n' \
+            "$stamp" "$stage" "$state" "$reason" "$used" "$mem_bytes" "$before" "$after" "$((after-before))" >> "$logfile"
+          echo "P7_SWAP $stage status=$state reason=$reason reclaimed_delta_bytes=$((after-before))"
+          exit 0
+          P7SWAP
+          chmod +x /tmp/rbe-test/p7-base-swap-reclaim.sh
+
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
         # P6: step timeout is secondary to the whole-job 345-minute guard.
@@ -1498,7 +1681,7 @@ jobs:
             fi
             echo "=== DISK AT ${stage}: $((available / 1073741824)) GiB physical-safe free ==="
           }
-          # The 320-minute deadline is measured from post-reclaim, not from
+          # The 345-minute deadline is measured from post-reclaim, not from
           # the start of bacon. Supervise Soong graph generation as well.
           if [ -s /tmp/rbe-test/job-start-epoch.txt ]; then
             JOB_START_EPOCH="$(cat /tmp/rbe-test/job-start-epoch.txt)"
@@ -1639,6 +1822,8 @@ jobs:
             local available now free_gib mem_kib seconds_left last_write idle_secs
             local line wait_rc warned=0 idle_warned=0 tick sample_counter=0
             local p5_probe_pid='' p5_probe_ticks=0
+            local p7_trim_started=0 p7_swap_last_try=0
+            local p7_ninja_pct=0 p7_swap_status=''
             local p6_ninja_last_epoch p6_ninja_started_epoch
             p6_ninja_started_epoch="$(date +%s)"
             p6_ninja_last_epoch="$p6_ninja_started_epoch"
@@ -1738,6 +1923,35 @@ jobs:
                 if [ -x /tmp/rbe-test/p6-ninja-sample.py ]; then
                   python3 /tmp/rbe-test/p6-ninja-sample.py "$log_file" "$p6_ninja_started_epoch" \
                     | tee -a /tmp/rbe-test/p6-ninja-sample.log || true
+                fi
+              fi
+
+              # P7: late disk-space recovery.  This is intentionally
+              # before the 7-GiB stop, with no change to the stop threshold.
+              # Both helpers are bounded, best-effort, and write real df/stat
+              # measurements. Never wait for slow trim/swapoff in this loop.
+              if [ "$phase" = full-rom-build ]; then
+                if (( p7_trim_started == 0 && available < 14*1073741824 && seconds_left > 600 )) \
+                   && [[ "${WORKSPACE_STORAGE:-plain}" == btrfs_zstd ]] \
+                   && [[ "${P7_BTRFS_FSTRIM:-0}" == 1 ]]; then
+                  p7_trim_started=1
+                  (/tmp/rbe-test/p7-btrfs-trim.sh low-disk \
+                    >> /tmp/rbe-test/p7-recovery-monitor.log 2>&1 || true) &
+                  echo 'P7: started one bounded background Btrfs trim.'
+                fi
+                if (( available < 15*1073741824 && seconds_left > 300 \
+                      && now-p7_swap_last_try >= 90 )) \
+                   && [[ "${P7_BASE_SWAP_RECLAIM:-0}" == 1 ]] \
+                   && [[ ! -f /tmp/rbe-test/p7-base-swap-reclaimed.txt ]]; then
+                  p7_ninja_pct="$(awk -F '\t' 'NF >= 5 && $5 ~ /^[0-9]+([.][0-9]+)?$/ {v=$5} END {print v+0}' \
+                    /tmp/rbe-test/p6-ninja-throughput.tsv 2>/dev/null || printf 0)"
+                  if awk -v current="$p7_ninja_pct" -v threshold="${P7_LATE_SWAP_MIN_PERCENT:-99.50}" \
+                      'BEGIN {exit !(current>=threshold)}'; then
+                    p7_swap_last_try=$now
+                    # Running in the background avoids blocking disk guards.
+                    (/tmp/rbe-test/p7-base-swap-reclaim.sh late \
+                      >> /tmp/rbe-test/p7-recovery-monitor.log 2>&1 || true) &
+                  fi
                 fi
               fi
 
@@ -1869,6 +2083,10 @@ jobs:
           fi
           swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
           df -h /home/runner/work/los
+          # P7 early status only: do not disable safety-net swap before bacon.
+          /tmp/rbe-test/p7-base-swap-reclaim.sh early || true
+          # Attempt hole punching once while Ninja is not compiling.
+          /tmp/rbe-test/p7-btrfs-trim.sh post-graph || true
           timeout 40s /tmp/rbe-test/p5-storage-probe.sh after-graph \
             >> /tmp/rbe-test/p5-storage-probe.log 2>&1 || true
           enforce_initial_disk_guard post-graph
@@ -2186,6 +2404,17 @@ jobs:
             echo "Workspace: **${WORKSPACE_STORAGE}**; Ninja remote=${NINJA_REMOTE_NUM_JOBS}, local=2, highmem=${NINJA_HIGHMEM_NUM_JOBS}."
             echo 'P5: legacy RBE_log_path removed; verbose=0; app/records under workspace compression (when Btrfs is selected).'
             echo "P6: whole-job guard=${FULL_ROM_SOFT_DEADLINE_MINUTES}m / 360m; deep storage=${P5_STORAGE_SAMPLE_INTERVAL_SECONDS}s; Ninja throughput=${P6_NINJA_SAMPLE_INTERVAL_SECONDS}s."
+            echo ''
+            echo '### P7 early runtime, base swap and Btrfs trim — physical disk deltas'
+            for p7file in /tmp/rbe-test/p7-runtime-cleanup-summary.txt                           /tmp/rbe-test/p7-runtime-cleanup.tsv                           /tmp/rbe-test/p7-base-swap-reclaim.log                           /tmp/rbe-test/p7-btrfs-trim.tsv; do
+              if [ -s "$p7file" ]; then
+                echo "**$(basename "$p7file")**"
+                echo '```text'
+                tail -n 20 "$p7file"
+                echo '```'
+              fi
+            done
+
             if [ -s /tmp/rbe-test/p5-storage-profile.tsv ]; then
               echo ''
               echo '### P5 storage footprint (most recent samples; bytes)'
@@ -2527,7 +2756,14 @@ jobs:
           timeout 45s find /home/runner/work/los/out -xdev -type f \
             -size +512M -printf '%s bytes %p\n' \
             >> /tmp/rbe-test/p5-large-output-files.txt 2>&1 || true
-          echo 'P5 diagnostics: metric sizes preserved; no live RBE logs or build outputs were deleted.'
+          echo '=== P7 RUNTIME / SWAP / BTRFS RECLAIM ==='
+          for file in /tmp/rbe-test/p7-runtime-cleanup-summary.txt \
+                      /tmp/rbe-test/p7-runtime-cleanup.tsv \
+                      /tmp/rbe-test/p7-base-swap-reclaim.log \
+                      /tmp/rbe-test/p7-btrfs-trim.tsv; do
+            if [ -s "$file" ]; then echo "--- $file"; tail -n 50 "$file"; fi
+          done
+          echo 'P5/P7 diagnostics: do not delete live RBE logs or build outputs.'
 
       - name: Release hybrid swap at job end (best effort)
         if: always()
