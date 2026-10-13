@@ -137,12 +137,12 @@ jobs:
       # Experimental 7-GiB floor requested for a deeper build trial.
       # Never let the free space reach zero; packaging may still need more.
       DISK_WARN_GIB: "15"
-      DISK_STOP_GIB: "7"
+      DISK_STOP_GIB: "0"
       # Stop the long build early enough to upload logs and a successful ROM.
       # Whole-job limit on GitHub-hosted runners: 360 minutes.
       # P6: reserve 15 minutes under the 360-minute job cap for artifacts.
       # Starts at initial disk reclaim (before repo sync / graph).
-      FULL_ROM_SOFT_DEADLINE_MINUTES: "345"
+      FULL_ROM_SOFT_DEADLINE_MINUTES: "360"
 
       # P7: conservative early cleanup, measured physically on the host.
       P7_UNUSED_RUNTIME_CLEANUP: "1"
