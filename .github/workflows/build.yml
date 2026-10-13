@@ -63,7 +63,7 @@ jobs:
       P9_BENCH_TIMEOUT_SECONDS: "210"
       BTRFS_WORKSPACE_IMAGE_GIB: "220"
       # P8: compress the complete workspace from the first repo write.
-      BTRFS_ZSTD_LEVEL: "3"
+      BTRFS_ZSTD_LEVEL: "1"
       # Benchmark identical built .o files at three levels ONCE during bacon.
       P8_BENCH_ENABLED: "1"
       P8_BENCH_START_PERCENT: "30"
