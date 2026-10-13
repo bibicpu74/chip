@@ -2216,7 +2216,7 @@ jobs:
                 # Only graph generation uses the reduced Go CPU parallelism.
                 unset GOMAXPROCS || true
               fi
-              m -j2 --skip-soong-tests "$target" 2>&1 | tee "$log_file"
+              m -j3 --skip-soong-tests "$target" 2>&1 | tee "$log_file"
               rc=${PIPESTATUS[0]}
               printf '%s\n' "$rc" > "$status_file"
               exit "$rc"
