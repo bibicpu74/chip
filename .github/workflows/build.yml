@@ -1,4 +1,4 @@
-name: LineageOS 20.0 - star2lte P9 Clang g1 + Java JAR diagnostics
+name: LineageOS 20.0 - star2lte P9.2 safe disk/ABI audit
 
 on:
   workflow_dispatch:
@@ -7,11 +7,27 @@ on:
         description: "Native Clang DWARF level (g1 reduces native debug size; g keeps baseline)"
         type: choice
         required: true
-        default: debug_level_1
+        default: debug_level_g
         options:
           - debug_level_1
           - debug_level_g
           - debug_level_0
+      source_abi_mode:
+        description: "Source ABI checks: preserve by default; optional experiment to skip source ABI only (not NDK)"
+        type: choice
+        required: true
+        default: preserve
+        options:
+          - preserve
+          - skip_source
+      abi_preflight:
+        description: "NDK libdl ABI validation before bacon: inspect (default), or build target"
+        type: choice
+        required: true
+        default: inspect
+        options:
+          - inspect
+          - build_libdl
       workspace_storage:
         description: "Android workspace: Btrfs ZSTD (default), or uncompressed plain"
         type: choice
@@ -36,7 +52,12 @@ jobs:
     env:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
       WORKSPACE_STORAGE: "${{ inputs.workspace_storage }}"
-      CLANG_DEFAULT_DEBUG_LEVEL: "${{ inputs.debug_info_level || 'debug_level_1' }}"
+      CLANG_DEFAULT_DEBUG_LEVEL: "${{ inputs.debug_info_level || 'debug_level_g' }}"
+      # P9.2: default is ABI-safe: no ABI bypass; the skip option is experimental.
+      SKIP_ABI_CHECKS: "${{ inputs.source_abi_mode == 'skip_source' && 'true' || 'false' }}"
+      P92_ABI_PREFLIGHT: "${{ inputs.abi_preflight || 'inspect' }}"
+      # P9.2 is strictly audit-only for .repo, Clang, source ABI and symbols.
+      P92_STORAGE_AUDIT_MODE: "audit_only"
       # Purely observational P9 diagnostics: no Java flags or JAR files are changed.
       P9_JAR_SCAN_TIMEOUT_SECONDS: "95"
       P9_BENCH_TIMEOUT_SECONDS: "210"
@@ -87,7 +108,7 @@ jobs:
 
       # Android Soong uses remote Ninja concurrency independently of -j2.
       # Keep the 2-job local pool, highmem pool=1; try up to 16 remote actions.
-      NINJA_REMOTE_NUM_JOBS: "32"
+      NINJA_REMOTE_NUM_JOBS: "16"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
       # Soong graph generation is local even with BuildBuddy RBE.
@@ -145,7 +166,13 @@ jobs:
             /opt/ghc \
             /usr/local/.ghcup \
             /opt/hostedtoolcache/CodeQL \
-            /usr/local/share/boost || true
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/local/lib/node_modules \
+            /usr/local/graalvm \
+            /usr/share/rust \
+            /usr/share/php* || true
           sudo docker image prune -a -f >/dev/null 2>&1 || true
 
           mkdir -p /home/runner/work/los /tmp/rbe-test
@@ -800,6 +827,107 @@ jobs:
               "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" >> "$TS"
           fi
           echo 'P1 trim changes the checkout only, not .repo Git object packs.'
+
+      # P9.2: inspect git dependencies and size candidates, NEVER delete any.
+      - name: P9.2 audit repo metadata ABI references Clang and symbols (read-only)
+        if: success()
+        working-directory: /home/runner/work/los
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          cat > /tmp/rbe-test/p92-storage-audit.sh <<'P92AUDIT'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          TOP=/home/runner/work/los
+          cd "$TOP" || exit 1
+          OUT=/tmp/rbe-test
+          SIZES="$OUT/p92-storage-candidates.tsv"
+          GIT="$OUT/p92-repo-git-dependencies.tsv"
+          CLANG="$OUT/p92-clang-inventory.tsv"
+          STATUS="$OUT/p92-audit-summary.txt"
+          printf 'candidate\tlogical_bytes_by_du\tstatus\n' > "$SIZES"
+          printf 'project\tgit_dir\thead_object_status\tlinked_into_repo\n' > "$GIT"
+          printf 'clang_directory\tlogical_bytes_by_du\tstatus\tprotected_reason\n' > "$CLANG"
+          printf 'mode=audit_only\nrepo_deleted=no\nabi_dump_deleted=no\nclang_deleted=no\nsymbols_deleted=no\n' > "$STATUS"
+          timeout_du() {
+            local name="$1" path="$2" secs="${3:-10}" got rc
+            if [ ! -e "$path" ]; then
+              printf '%s\t0\tabsent\n' "$name" >> "$SIZES"
+              return 0
+            fi
+            got="$(timeout -k 2s "${secs}s" du -sxB1 -- "$path" 2>/dev/null)"
+            rc=$?
+            if [[ "$rc" == 0 && "$got" =~ ^[0-9]+ ]]; then
+              printf '%s\t%s\tmeasured-du-not-host-physical\n' "$name" "${got%%[[:space:]]*}" >> "$SIZES"
+            else
+              printf '%s\tunknown\ttimeout-or-error-%s\n' "$name" "$rc" >> "$SIZES"
+            fi
+          }
+          before="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+          echo "root_free_before_bytes=$before" >> "$STATUS"
+          for path in .repo/project-objects .repo/projects .repo/manifests .repo/local_manifests prebuilts/abi-dumps prebuilts/clang/host/linux-x86 out/target/product/star2lte/symbols; do
+            timeout_du "$path" "$path" 13
+          done
+          # Sample representative .git indirections and Git object availability.
+          # Git cat-file is read-only; if it fails, NEVER delete the object store.
+          for project in build/soong frameworks/base external/libvpx device/samsung/star2lte prebuilts/clang/host/linux-x86; do
+            if [ ! -d "$project" ]; then
+              printf '%s\tabsent\tproject-absent\tunknown\n' "$project" >> "$GIT"
+              continue
+            fi
+            dir="$(timeout 8s git -C "$project" rev-parse --absolute-git-dir 2>/dev/null)"; rc=$?
+            [ "$rc" -eq 0 ] || dir='unavailable'
+            if timeout 8s git -C "$project" cat-file -e 'HEAD^{commit}' 2>/dev/null; then
+              head_status=ok
+            else
+              head_status=failed
+            fi
+            case "$dir" in
+              "$TOP"/.repo/*) linked=yes;;
+              *) linked=unknown;;
+            esac
+            printf '%s\t%s\t%s\t%s\n' "$project" "$dir" "$head_status" "$linked" >> "$GIT"
+          done
+          if [ -d prebuilts/clang/host/linux-x86 ]; then
+            while IFS= read -r -d '' tool; do
+              base="${tool##*/}"
+              value="$(timeout -k 2s 8s du -sxB1 -- "$tool" 2>/dev/null)"; rc=$?
+              if [ "$rc" -eq 0 ]; then bytes="${value%%[[:space:]]*}"; stat=measured; else bytes=unknown; stat=timeout; fi
+              case "$base" in
+                clang-3289846) reason=RenderScript-legacy-must-keep;;
+                clang-r450784d*) reason=Android13-main-compiler-must-keep;;
+                clang-stable|llvm-binutils-stable) reason=potential-host-tools-must-keep;;
+                *) reason=unverified-do-not-delete;;
+              esac
+              printf '%s\t%s\t%s\t%s\n' "$tool" "$bytes" "$stat" "$reason" >> "$CLANG"
+            done < <(find prebuilts/clang/host/linux-x86 -mindepth 1 -maxdepth 1 -type d -name 'clang-*' -print0)
+          fi
+          {
+            echo '=== ABI SOURCE REFERENCES (not deletion authorization) ==='
+            timeout 10s grep -R -n -m 2 -E 'SKIP_ABI_CHECKS|abi-dumps/ndk' build/soong/cc --include='*.go' 2>/dev/null | head -30 || true
+            echo '=== CONFIGURED ABI ENV ==='
+            echo "SKIP_ABI_CHECKS=${SKIP_ABI_CHECKS:-false}"
+            echo '=== CLANG DIRECT REFERENCES (bounded source check) ==='
+            timeout 12s grep -R -n -m 1 -E 'clang-3289846|clang-r450784d|clang-stable' build/soong/cc/config device/samsung/star2lte device/samsung/exynos9810-common --include='*.mk' --include='*.go' --include='*.sh' 2>/dev/null | head -35 || true
+          } > "$OUT/p92-build-reference-hints.txt"
+          after="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+          echo "root_free_after_bytes=$after" >> "$STATUS"
+          if [ -f /tmp/los20-workspace-btrfs.img ]; then
+            stat -c 'backing_allocated_blocks=%b backing_block_bytes=%B' /tmp/los20-workspace-btrfs.img >> "$STATUS"
+          fi
+          echo 'No worktrees or Git metadata removed. All sizes are observational.' >> "$STATUS"
+          cat "$STATUS"
+          cat "$GIT"
+          cat "$CLANG"
+          P92AUDIT
+          chmod 0755 /tmp/rbe-test/p92-storage-audit.sh
+          # The audit never causes a build failure; keep logs for diagnostics.
+          timeout --signal=TERM --kill-after=3s 150s \
+            /tmp/rbe-test/p92-storage-audit.sh \
+            > /tmp/rbe-test/p92-audit-run.log 2>&1 || true
+          tail -n 80 /tmp/rbe-test/p92-audit-run.log 2>/dev/null || true
 
       # P9: Old Android 13 Soong may hardcode "-g" in commonGlobalCflags.
       # Newer Soong branches honor CLANG_DEFAULT_DEBUG_LEVEL directly.
@@ -2646,6 +2774,43 @@ jobs:
           # All preflight output stays under /tmp; no generated Ninja target
           # is modified. pipefail propagates genuine local Clang failures.
 
+          # P9.2 ABI guard: -g1/-g0 are experimental on this LineageOS 20 tree.
+          # With global reduced DWARF, P9 failed at libdl.ndk abitidy due to
+          # untyped ELF symbols. Require opt-in to the actual ABI smoke build.
+          # The default -g baseline runs an observational check only.
+          mark_stage p92-abi-preflight
+          ABI_CHECK_LOG=/tmp/rbe-test/p92-ndk-abi-preflight.log
+          {
+            echo "native_debug=$CLANG_DEFAULT_DEBUG_LEVEL"
+            echo "skip_source_abi_checks=$SKIP_ABI_CHECKS"
+            echo "requested_abi_preflight=$P92_ABI_PREFLIGHT"
+            echo 'note=SKIP_ABI_CHECKS does not guarantee skipping NDK stub ABI generation'
+            echo 'ndk_reference=out/soong/abi-dumps/ndk/21/arm64/libdl/abi.xml'
+          } > "$ABI_CHECK_LOG"
+          if [[ "$CLANG_DEFAULT_DEBUG_LEVEL" != debug_level_g && "$P92_ABI_PREFLIGHT" != build_libdl ]]; then
+            echo '::error::Reduced native debug requires abi_preflight=build_libdl; aborting before bacon.' | tee -a "$ABI_CHECK_LOG"
+            exit 1
+          fi
+          if [[ "$P92_ABI_PREFLIGHT" == build_libdl ]]; then
+            # This test may add build time. It is opt-in and monitored with
+            # the same disk and whole-job guards as the main build.
+            ABI_TARGET=out/soong/abi-dumps/ndk/21/arm64/libdl/abi.xml
+            echo "Running early ABI build target: $ABI_TARGET" | tee -a "$ABI_CHECK_LOG"
+            run_monitored_m p92-abi-preflight "$ABI_TARGET" \
+              /tmp/rbe-test/p92-abi-target-build.log \
+              /tmp/rbe-test/p92-abi-exit-code.txt \
+              /tmp/rbe-test/p92-abi-disk-stop.txt \
+              /tmp/rbe-test/p92-abi-time-stop.txt
+            if [ "$MONITORED_RC" -ne 0 ] || [ ! -s "$ABI_TARGET" ]; then
+              echo '::error::NDK libdl ABI preflight failed or target not produced; inspect p92-abi-target-build.log.' | tee -a "$ABI_CHECK_LOG"
+              tail -n 100 /tmp/rbe-test/p92-abi-target-build.log 2>/dev/null || true
+              exit 1
+            fi
+            echo 'status=passed-full-target-build' >> "$ABI_CHECK_LOG"
+          else
+            echo 'status=baseline-debug-g-inspect-only' >> "$ABI_CHECK_LOG"
+          fi
+
           mark_stage pre-build
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
           echo "RBE remote_local_fallback enabled; local jobs=2, remote jobs=${NINJA_REMOTE_NUM_JOBS}, highmem=1."
@@ -2741,6 +2906,15 @@ jobs:
             echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
             echo "Workspace: **${WORKSPACE_STORAGE}**; Ninja remote=${NINJA_REMOTE_NUM_JOBS}, local=2, highmem=${NINJA_HIGHMEM_NUM_JOBS}."
             echo "P8 Btrfs ZSTD level: **${BTRFS_ZSTD_LEVEL}**; benchmark ZSTD 1/3/5 is bounded and observational."
+            echo "P9.2: Clang debug=${CLANG_DEFAULT_DEBUG_LEVEL}; source ABI checks skip=${SKIP_ABI_CHECKS}; NDK ABI preflight=${P92_ABI_PREFLIGHT}."
+            for audit in /tmp/rbe-test/p92-audit-summary.txt /tmp/rbe-test/p92-ndk-abi-preflight.log; do
+              if [ -s "$audit" ]; then
+                echo "### $(basename "$audit")"
+                echo '```text'
+                head -n 35 "$audit"
+                echo '```'
+              fi
+            done
             if [ -s /tmp/rbe-test/p8-compression-benchmark.tsv ]; then
               echo '### P8 compression benchmark'
               echo '```'
@@ -3144,6 +3318,29 @@ jobs:
           echo 'P8 measurements preserve all generated outputs and existing disk guards.'
 
       # P9: bounded post-build inventory, read-only and off critical build path.
+      - name: P9.2 final symbols and ABI output footprint (read-only)
+        if: always()
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set +e
+          LOG=/tmp/rbe-test/p92-final-output-footprint.txt
+          {
+            echo '=== FINAL OUTPUT CANDIDATES ==='
+            for path in out/target/product/star2lte/symbols out/soong/abi-dumps out/target/product/star2lte; do
+              if [ -d "$path" ]; then
+                timeout 15s du -sxh -- "$path" || true
+              else
+                echo "absent=$path"
+              fi
+            done
+            echo '=== FINAL HOST VS WORKSPACE DISK ==='
+            df -hT / /home/runner/work/los
+            echo '=== SYMBOL OUTPUT SAFETY ==='
+            echo 'symbols_deleted=no (Ninja may require these outputs)'
+          } > "$LOG" 2>&1
+          tail -n 45 "$LOG"
+
       - name: P9 analyze JAR intermediates, duplicate candidates and local Java cost
         if: always()
         shell: bash
