@@ -114,7 +114,7 @@ jobs:
       # Soong graph generation is local even with BuildBuddy RBE.
       # Go GC is tuned for the standard ~16-GB GitHub runner.
       # P0: lower Go GC target; limit only activates with Go >= 1.19.
-      SOONG_GOGC: "25"
+      SOONG_GOGC: "45"
       SOONG_GOMEMLIMIT: "6GiB"
       # Limit active Go workers during the memory-heavy graph generation only.
       SOONG_GRAPH_GOMAXPROCS: "2"
@@ -2457,7 +2457,7 @@ jobs:
           GRAPH_SWAP=/mnt/soong-swap-graph
           BASE_SWAP=/mnt/soong-swap-base
           RECLAIM_STATUS=/tmp/rbe-test/graph-swap-reclaim.txt
-          MAX_RECLAIM_USED_BYTES=$((256 * 1024 * 1024))
+          MAX_RECLAIM_USED_BYTES=$((4 * 1024 * 1024 * 1024))
           MIN_RAM_MARGIN_BYTES=$((2 * 1024 * 1024 * 1024))
           free_disk_before="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
           graph_swap_used='na'
